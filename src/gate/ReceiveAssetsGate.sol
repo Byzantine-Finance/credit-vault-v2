@@ -3,7 +3,7 @@
 // The implementation of this contract was inspired by Morpho Vault V2, developed by the Morpho Association in 2025.
 pragma solidity ^0.8.0;
 
-import "./GateBase.sol";
+import {GateBase} from "./GateBase.sol";
 import {IReceiveAssetsGate} from "../../src/interfaces/IGate.sol";
 
 /**
@@ -12,7 +12,7 @@ import {IReceiveAssetsGate} from "../../src/interfaces/IGate.sol";
  */
 contract ReceiveAssetsGate is GateBase, IReceiveAssetsGate {
     constructor(address _initialOwner) GateBase(_initialOwner) {}
-    
+
     /// @notice Check if `account` can receive assets when a withdrawal is made.
     function canReceiveAssets(address account) external view returns (bool) {
         return _whitelistedOrHandlingOnBehalf(account);
