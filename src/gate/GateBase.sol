@@ -34,10 +34,7 @@ abstract contract GateBase is Ownable2Step {
     /* EVENTS */
 
     event SetIsWhitelisted(address indexed account, bool newIsWhitelisted);
-    event SetIsBundlerAdapter(
-        address indexed account,
-        bool newIsBundlerAdapter
-    );
+    event SetIsBundlerAdapter(address indexed account, bool newIsBundlerAdapter);
 
     /* ERRORS */
 
@@ -51,54 +48,35 @@ abstract contract GateBase is Ownable2Step {
     /* ROLES FUNCTIONS */
 
     /// @notice Set who is whitelisted.
-    function setIsWhitelisted(
-        address account,
-        bool newIsWhitelisted
-    ) external onlyOwner {
+    function setIsWhitelisted(address account, bool newIsWhitelisted) external onlyOwner {
         _setIsWhitelisted(account, newIsWhitelisted);
     }
 
     /// @notice Set who is whitelisted in batch.
-    function setIsWhitelistedBatch(
-        address[] memory accounts,
-        bool[] memory newIsWhitelisted
-    ) external onlyOwner {
-        require(
-            accounts.length == newIsWhitelisted.length,
-            ArrayLengthMismatch()
-        );
+    function setIsWhitelistedBatch(address[] memory accounts, bool[] memory newIsWhitelisted) external onlyOwner {
+        require(accounts.length == newIsWhitelisted.length, ArrayLengthMismatch());
         for (uint256 i; i < accounts.length; ++i) {
             _setIsWhitelisted(accounts[i], newIsWhitelisted[i]);
         }
     }
 
     /// @notice Set who is allowed to handle shares and assets on behalf of another account.
-    function setIsBundlerAdapter(
-        address account,
-        bool newIsBundlerAdapter
-    ) external onlyOwner {
+    function setIsBundlerAdapter(address account, bool newIsBundlerAdapter) external onlyOwner {
         isBundlerAdapter[account] = newIsBundlerAdapter;
         emit SetIsBundlerAdapter(account, newIsBundlerAdapter);
     }
 
     /* INTERNAL FUNCTIONS */
 
-    function _setIsWhitelisted(
-        address account,
-        bool newIsWhitelisted
-    ) internal {
+    function _setIsWhitelisted(address account, bool newIsWhitelisted) internal {
         require(whitelisted[account] != newIsWhitelisted, AlreadySet());
         whitelisted[account] = newIsWhitelisted;
         emit SetIsWhitelisted(account, newIsWhitelisted);
     }
 
     /// @notice Check if `account` is whitelisted or handling on behalf of another account.
-    function _whitelistedOrHandlingOnBehalf(
-        address account
-    ) internal view returns (bool) {
-        return
-            whitelisted[account] ||
-            (isBundlerAdapter[account] &&
-                whitelisted[IBundlerAdapter(account).BUNDLER3().initiator()]);
+    function _whitelistedOrHandlingOnBehalf(address account) internal view returns (bool) {
+        return whitelisted[account]
+            || (isBundlerAdapter[account] && whitelisted[IBundlerAdapter(account).BUNDLER3().initiator()]);
     }
 }
