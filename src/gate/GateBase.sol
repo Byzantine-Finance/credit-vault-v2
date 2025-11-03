@@ -40,6 +40,7 @@ abstract contract GateBase is Ownable2Step {
 
     error ArrayLengthMismatch();
     error AlreadySet();
+    error NotAllowedToRenounceOwnership();
 
     /* CONSTRUCTOR */
 
@@ -64,6 +65,11 @@ abstract contract GateBase is Ownable2Step {
     function setIsBundlerAdapter(address account, bool newIsBundlerAdapter) external onlyOwner {
         isBundlerAdapter[account] = newIsBundlerAdapter;
         emit SetIsBundlerAdapter(account, newIsBundlerAdapter);
+    }
+
+    /// @notice Not allowed to renounce ownership.
+    function renounceOwnership() public virtual override onlyOwner {
+        revert NotAllowedToRenounceOwnership();
     }
 
     /* INTERNAL FUNCTIONS */

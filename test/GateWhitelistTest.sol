@@ -346,4 +346,26 @@ contract GateWhitelistTest is BaseTest {
         sendSharesGate.setIsWhitelisted(initiatorAddr, false);
         assertFalse(sendSharesGate.canSendShares(bundlerAdapterAddr));
     }
+
+    function testRenounceOwnershipNotAllowed() public {
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        receiveAssetsGate.renounceOwnership();
+        assertEq(receiveAssetsGate.owner(), gateOwner);
+
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        receiveSharesGate.renounceOwnership();
+        assertEq(receiveSharesGate.owner(), gateOwner);
+
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        sendAssetsGate.renounceOwnership();
+        assertEq(sendAssetsGate.owner(), gateOwner);
+
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        sendSharesGate.renounceOwnership();
+        assertEq(sendSharesGate.owner(), gateOwner);
+    }
 }
