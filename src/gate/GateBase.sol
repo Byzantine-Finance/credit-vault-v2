@@ -68,7 +68,7 @@ abstract contract GateBase is Ownable2Step {
     }
 
     /// @notice Not allowed to renounce ownership.
-    function renounceOwnership() public virtual override onlyOwner {
+    function renounceOwnership() public view override onlyOwner {
         revert NotAllowedToRenounceOwnership();
     }
 
