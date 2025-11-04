@@ -1,0 +1,9 @@
+{
+  "addresses": {
+    "vault": "0x375f2aC71E77440eb9Fc64e112F6b93D9ba1877f"
+  },
+  "chainInfo": {
+    "chainId": 84532,
+    "deploymentBlock": 31083671
+  }
+}
