@@ -3,7 +3,11 @@
 pragma solidity ^0.8.0;
 
 import "./BaseTest.sol";
-import "../src/gate/GateWhitelist.sol";
+import "../src/gate/ReceiveAssetsGate.sol";
+import "../src/gate/ReceiveSharesGate.sol";
+import "../src/gate/SendAssetsGate.sol";
+import "../src/gate/SendSharesGate.sol";
+import "../src/gate/GateBase.sol";
 
 contract Bundler3Mock {
     address private _initiator;
@@ -30,88 +34,159 @@ contract BundlerAdapterMock {
 }
 
 contract GateWhitelistTest is BaseTest {
-    GateWhitelist gate;
+    ReceiveAssetsGate receiveAssetsGate;
+    ReceiveSharesGate receiveSharesGate;
+    SendAssetsGate sendAssetsGate;
+    SendSharesGate sendSharesGate;
     address immutable gateOwner = makeAddr("gateOwner");
 
     function setUp() public override {
         super.setUp();
-        gate = new GateWhitelist(gateOwner);
+        receiveAssetsGate = new ReceiveAssetsGate(gateOwner);
+        receiveSharesGate = new ReceiveSharesGate(gateOwner);
+        sendAssetsGate = new SendAssetsGate(gateOwner);
+        sendSharesGate = new SendSharesGate(gateOwner);
     }
 
     function testConstructor() public view {
-        assertEq(gate.owner(), gateOwner);
+        assertEq(receiveAssetsGate.owner(), gateOwner);
+        assertEq(receiveSharesGate.owner(), gateOwner);
+        assertEq(sendAssetsGate.owner(), gateOwner);
+        assertEq(sendSharesGate.owner(), gateOwner);
     }
 
     function testOwnerOperations(address newOwner, address nonOwner) public {
         vm.assume(newOwner != address(0));
         vm.assume(nonOwner != address(0) && nonOwner != gateOwner);
 
-        // Non-owner cannot set owner
+        // Non-owner cannot transfer ownership (test receiveAssetsGate as example)
         vm.prank(nonOwner);
-        vm.expectRevert(GateWhitelist.Unauthorized.selector);
-        gate.setOwner(newOwner);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", nonOwner));
+        receiveAssetsGate.transferOwnership(newOwner);
 
-        // Owner can set owner
+        // Owner can transfer ownership (test all gates)
         vm.prank(gateOwner);
-        vm.expectEmit();
-        emit GateWhitelist.SetOwner(gateOwner, newOwner);
-        gate.setOwner(newOwner);
-        assertEq(gate.owner(), newOwner);
+        receiveAssetsGate.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        receiveAssetsGate.acceptOwnership();
+        assertEq(receiveAssetsGate.owner(), newOwner);
+
+        vm.prank(gateOwner);
+        receiveSharesGate.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        receiveSharesGate.acceptOwnership();
+        assertEq(receiveSharesGate.owner(), newOwner);
+
+        vm.prank(gateOwner);
+        sendAssetsGate.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        sendAssetsGate.acceptOwnership();
+        assertEq(sendAssetsGate.owner(), newOwner);
+
+        vm.prank(gateOwner);
+        sendSharesGate.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        sendSharesGate.acceptOwnership();
+        assertEq(sendSharesGate.owner(), newOwner);
     }
 
     function testWhitelistOperations(address account, bool isWhitelisted, address nonOwner) public {
         vm.assume(account != address(0));
         vm.assume(nonOwner != address(0) && nonOwner != gateOwner);
+        vm.assume(isWhitelisted == true); // Can only set to true to avoid AlreadySet error
 
         // Non-owner cannot whitelist
         vm.prank(nonOwner);
-        vm.expectRevert(GateWhitelist.Unauthorized.selector);
-        gate.setIsWhitelisted(account, isWhitelisted);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", nonOwner));
+        receiveAssetsGate.setIsWhitelisted(account, isWhitelisted);
 
-        // Owner can whitelist
+        // Owner can whitelist (test all gates)
+        // Test ReceiveAssetsGate
         vm.prank(gateOwner);
-        vm.expectEmit();
-        emit GateWhitelist.SetIsWhitelisted(account, isWhitelisted);
-        gate.setIsWhitelisted(account, isWhitelisted);
-        assertEq(gate.whitelisted(account), isWhitelisted);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsWhitelisted(account, isWhitelisted);
+        receiveAssetsGate.setIsWhitelisted(account, isWhitelisted);
+        assertEq(receiveAssetsGate.whitelisted(account), isWhitelisted);
+        assertEq(receiveAssetsGate.canReceiveAssets(account), isWhitelisted);
 
-        // Check that permission functions match whitelist status
-        assertEq(gate.canSendShares(account), isWhitelisted);
-        assertEq(gate.canReceiveAssets(account), isWhitelisted);
-        assertEq(gate.canReceiveShares(account), isWhitelisted);
-        assertEq(gate.canSendAssets(account), isWhitelisted);
+        // Test ReceiveSharesGate
+        vm.prank(gateOwner);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsWhitelisted(account, isWhitelisted);
+        receiveSharesGate.setIsWhitelisted(account, isWhitelisted);
+        assertEq(receiveSharesGate.whitelisted(account), isWhitelisted);
+        assertEq(receiveSharesGate.canReceiveShares(account), isWhitelisted);
+
+        // Test SendAssetsGate
+        vm.prank(gateOwner);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsWhitelisted(account, isWhitelisted);
+        sendAssetsGate.setIsWhitelisted(account, isWhitelisted);
+        assertEq(sendAssetsGate.whitelisted(account), isWhitelisted);
+        assertEq(sendAssetsGate.canSendAssets(account), isWhitelisted);
+
+        // Test SendSharesGate
+        vm.prank(gateOwner);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsWhitelisted(account, isWhitelisted);
+        sendSharesGate.setIsWhitelisted(account, isWhitelisted);
+        assertEq(sendSharesGate.whitelisted(account), isWhitelisted);
+        assertEq(sendSharesGate.canSendShares(account), isWhitelisted);
     }
 
-    function testSetIsWhitelistedBatch(bool[] memory isWhitelistedArray, address nonOwner) public {
-        vm.assume(isWhitelistedArray.length > 0 && isWhitelistedArray.length <= 10);
+    function testSetIsWhitelistedBatch(uint8 arrayLength, address nonOwner) public {
+        vm.assume(arrayLength > 0 && arrayLength <= 10);
         vm.assume(nonOwner != address(0) && nonOwner != gateOwner);
-        address[] memory accounts = new address[](isWhitelistedArray.length);
+
+        address[] memory accounts = new address[](arrayLength);
+        bool[] memory isWhitelistedArray = new bool[](arrayLength);
+
         for (uint256 i; i < accounts.length; ++i) {
             accounts[i] = makeAddr(string(abi.encodePacked("account", vm.toString(i))));
+            isWhitelistedArray[i] = true; // Set all to true to avoid AlreadySet error
         }
 
-        // Non-owner cannot whitelist batch
+        // Non-owner cannot whitelist batch (test receiveAssetsGate as example)
         vm.prank(nonOwner);
-        vm.expectRevert(GateWhitelist.Unauthorized.selector);
-        gate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", nonOwner));
+        receiveAssetsGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
 
         // Owner can whitelist batch
         vm.prank(gateOwner);
         for (uint256 i; i < accounts.length; ++i) {
-            vm.expectEmit();
-            emit GateWhitelist.SetIsWhitelisted(accounts[i], isWhitelistedArray[i]);
+            vm.expectEmit(true, true, true, true);
+            emit GateBase.SetIsWhitelisted(accounts[i], isWhitelistedArray[i]);
         }
-        gate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+        receiveAssetsGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
 
         // Verify that all accounts have been correctly updated
         for (uint256 i; i < accounts.length; ++i) {
-            assertEq(gate.whitelisted(accounts[i]), isWhitelistedArray[i]);
+            assertEq(receiveAssetsGate.whitelisted(accounts[i]), isWhitelistedArray[i]);
+            assertEq(receiveAssetsGate.canReceiveAssets(accounts[i]), isWhitelistedArray[i]);
+        }
 
-            // Check that permission functions match whitelist status
-            assertEq(gate.canSendShares(accounts[i]), isWhitelistedArray[i]);
-            assertEq(gate.canReceiveAssets(accounts[i]), isWhitelistedArray[i]);
-            assertEq(gate.canReceiveShares(accounts[i]), isWhitelistedArray[i]);
-            assertEq(gate.canSendAssets(accounts[i]), isWhitelistedArray[i]);
+        // Test ReceiveSharesGate
+        vm.prank(gateOwner);
+        receiveSharesGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+        for (uint256 i; i < accounts.length; ++i) {
+            assertEq(receiveSharesGate.whitelisted(accounts[i]), isWhitelistedArray[i]);
+            assertEq(receiveSharesGate.canReceiveShares(accounts[i]), isWhitelistedArray[i]);
+        }
+
+        // Test SendAssetsGate
+        vm.prank(gateOwner);
+        sendAssetsGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+        for (uint256 i; i < accounts.length; ++i) {
+            assertEq(sendAssetsGate.whitelisted(accounts[i]), isWhitelistedArray[i]);
+            assertEq(sendAssetsGate.canSendAssets(accounts[i]), isWhitelistedArray[i]);
+        }
+
+        // Test SendSharesGate
+        vm.prank(gateOwner);
+        sendSharesGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+        for (uint256 i; i < accounts.length; ++i) {
+            assertEq(sendSharesGate.whitelisted(accounts[i]), isWhitelistedArray[i]);
+            assertEq(sendSharesGate.canSendShares(accounts[i]), isWhitelistedArray[i]);
         }
     }
 
@@ -119,11 +194,53 @@ contract GateWhitelistTest is BaseTest {
         public
     {
         vm.assume(accounts.length != isWhitelistedArray.length);
-        vm.assume(accounts.length > 0 || isWhitelistedArray.length > 0);
+        vm.assume(accounts.length > 0);
+        vm.assume(isWhitelistedArray.length > 0);
 
+        // Test ReceiveAssetsGate
         vm.prank(gateOwner);
-        vm.expectRevert(GateWhitelist.ArrayLengthMismatch.selector);
-        gate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+        vm.expectRevert(abi.encodeWithSignature("ArrayLengthMismatch()"));
+        receiveAssetsGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+
+        // Test ReceiveSharesGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("ArrayLengthMismatch()"));
+        receiveSharesGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+
+        // Test SendAssetsGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("ArrayLengthMismatch()"));
+        sendAssetsGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+
+        // Test SendSharesGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("ArrayLengthMismatch()"));
+        sendSharesGate.setIsWhitelistedBatch(accounts, isWhitelistedArray);
+    }
+
+    function testSetIsWhitelistedAlreadySet(address account, bool isWhitelisted) public {
+        vm.assume(account != address(0));
+        vm.assume(isWhitelisted == false); // Can only set to false to test AlreadySet error
+
+        // Test ReceiveAssetsGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("AlreadySet()"));
+        receiveAssetsGate.setIsWhitelisted(account, isWhitelisted);
+
+        // Test ReceiveSharesGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("AlreadySet()"));
+        receiveSharesGate.setIsWhitelisted(account, isWhitelisted);
+
+        // Test SendAssetsGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("AlreadySet()"));
+        sendAssetsGate.setIsWhitelisted(account, isWhitelisted);
+
+        // Test SendSharesGate
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("AlreadySet()"));
+        sendSharesGate.setIsWhitelisted(account, isWhitelisted);
     }
 
     function testBundlerAdapterOperations(address bundlerAdapterAddr, bool isAdapter, address nonOwner) public {
@@ -132,50 +249,123 @@ contract GateWhitelistTest is BaseTest {
 
         // Non-owner cannot set bundler adapter
         vm.prank(nonOwner);
-        vm.expectRevert(GateWhitelist.Unauthorized.selector);
-        gate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", nonOwner));
+        receiveAssetsGate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
 
-        // Owner can set bundler adapter
+        // Owner can set bundler adapter (test all gates)
+        // Test ReceiveAssetsGate
         vm.prank(gateOwner);
-        vm.expectEmit();
-        emit GateWhitelist.SetIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
-        gate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
-        assertEq(gate.isBundlerAdapter(bundlerAdapterAddr), isAdapter);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        receiveAssetsGate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        assertEq(receiveAssetsGate.isBundlerAdapter(bundlerAdapterAddr), isAdapter);
+
+        // Test ReceiveSharesGate
+        vm.prank(gateOwner);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        receiveSharesGate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        assertEq(receiveSharesGate.isBundlerAdapter(bundlerAdapterAddr), isAdapter);
+
+        // Test SendAssetsGate
+        vm.prank(gateOwner);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        sendAssetsGate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        assertEq(sendAssetsGate.isBundlerAdapter(bundlerAdapterAddr), isAdapter);
+
+        // Test SendSharesGate
+        vm.prank(gateOwner);
+        vm.expectEmit(true, true, true, true);
+        emit GateBase.SetIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        sendSharesGate.setIsBundlerAdapter(bundlerAdapterAddr, isAdapter);
+        assertEq(sendSharesGate.isBundlerAdapter(bundlerAdapterAddr), isAdapter);
     }
 
     function testAdapterWithWhitelistedInitiator(address initiatorAddr, bool isWhitelisted) public {
         vm.assume(initiatorAddr != address(0));
+        vm.assume(isWhitelisted == true); // Can only test setting to true initially
 
         // Create a new bundler and adapter for the test
         address bundlerAddr = address(new Bundler3Mock(initiatorAddr));
         address bundlerAdapterAddr = address(new BundlerAdapterMock(IBundler3(bundlerAddr)));
 
-        // Whitelist initiator
+        // Test ReceiveAssetsGate
         vm.prank(gateOwner);
-        gate.setIsWhitelisted(initiatorAddr, isWhitelisted);
+        receiveAssetsGate.setIsWhitelisted(initiatorAddr, isWhitelisted);
 
         // Test when bundler adapter is not registered
-        assertFalse(gate.canSendShares(bundlerAdapterAddr));
-        assertFalse(gate.canReceiveAssets(bundlerAdapterAddr));
-        assertFalse(gate.canReceiveShares(bundlerAdapterAddr));
-        assertFalse(gate.canSendAssets(bundlerAdapterAddr));
+        assertFalse(receiveAssetsGate.canReceiveAssets(bundlerAdapterAddr));
 
         // Test when bundler adapter is registered
         vm.prank(gateOwner);
-        gate.setIsBundlerAdapter(bundlerAdapterAddr, true);
-
-        assertEq(gate.canSendShares(bundlerAdapterAddr), isWhitelisted);
-        assertEq(gate.canReceiveAssets(bundlerAdapterAddr), isWhitelisted);
-        assertEq(gate.canReceiveShares(bundlerAdapterAddr), isWhitelisted);
-        assertEq(gate.canSendAssets(bundlerAdapterAddr), isWhitelisted);
+        receiveAssetsGate.setIsBundlerAdapter(bundlerAdapterAddr, true);
+        assertEq(receiveAssetsGate.canReceiveAssets(bundlerAdapterAddr), isWhitelisted);
 
         // Unwhitelist initiator
         vm.prank(gateOwner);
-        gate.setIsWhitelisted(initiatorAddr, false);
+        receiveAssetsGate.setIsWhitelisted(initiatorAddr, false);
+        assertFalse(receiveAssetsGate.canReceiveAssets(bundlerAdapterAddr));
 
-        assertFalse(gate.canSendShares(bundlerAdapterAddr));
-        assertFalse(gate.canReceiveAssets(bundlerAdapterAddr));
-        assertFalse(gate.canReceiveShares(bundlerAdapterAddr));
-        assertFalse(gate.canSendAssets(bundlerAdapterAddr));
+        // Test ReceiveSharesGate
+        vm.prank(gateOwner);
+        receiveSharesGate.setIsWhitelisted(initiatorAddr, isWhitelisted);
+        assertFalse(receiveSharesGate.canReceiveShares(bundlerAdapterAddr));
+
+        vm.prank(gateOwner);
+        receiveSharesGate.setIsBundlerAdapter(bundlerAdapterAddr, true);
+        assertEq(receiveSharesGate.canReceiveShares(bundlerAdapterAddr), isWhitelisted);
+
+        vm.prank(gateOwner);
+        receiveSharesGate.setIsWhitelisted(initiatorAddr, false);
+        assertFalse(receiveSharesGate.canReceiveShares(bundlerAdapterAddr));
+
+        // Test SendAssetsGate
+        vm.prank(gateOwner);
+        sendAssetsGate.setIsWhitelisted(initiatorAddr, isWhitelisted);
+        assertFalse(sendAssetsGate.canSendAssets(bundlerAdapterAddr));
+
+        vm.prank(gateOwner);
+        sendAssetsGate.setIsBundlerAdapter(bundlerAdapterAddr, true);
+        assertEq(sendAssetsGate.canSendAssets(bundlerAdapterAddr), isWhitelisted);
+
+        vm.prank(gateOwner);
+        sendAssetsGate.setIsWhitelisted(initiatorAddr, false);
+        assertFalse(sendAssetsGate.canSendAssets(bundlerAdapterAddr));
+
+        // Test SendSharesGate
+        vm.prank(gateOwner);
+        sendSharesGate.setIsWhitelisted(initiatorAddr, isWhitelisted);
+        assertFalse(sendSharesGate.canSendShares(bundlerAdapterAddr));
+
+        vm.prank(gateOwner);
+        sendSharesGate.setIsBundlerAdapter(bundlerAdapterAddr, true);
+        assertEq(sendSharesGate.canSendShares(bundlerAdapterAddr), isWhitelisted);
+
+        vm.prank(gateOwner);
+        sendSharesGate.setIsWhitelisted(initiatorAddr, false);
+        assertFalse(sendSharesGate.canSendShares(bundlerAdapterAddr));
+    }
+
+    function testRenounceOwnershipNotAllowed() public {
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        receiveAssetsGate.renounceOwnership();
+        assertEq(receiveAssetsGate.owner(), gateOwner);
+
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        receiveSharesGate.renounceOwnership();
+        assertEq(receiveSharesGate.owner(), gateOwner);
+
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        sendAssetsGate.renounceOwnership();
+        assertEq(sendAssetsGate.owner(), gateOwner);
+
+        vm.prank(gateOwner);
+        vm.expectRevert(abi.encodeWithSignature("NotAllowedToRenounceOwnership()"));
+        sendSharesGate.renounceOwnership();
+        assertEq(sendSharesGate.owner(), gateOwner);
     }
 }
