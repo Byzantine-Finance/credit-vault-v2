@@ -13,7 +13,7 @@ fs_permissions = [
 [profile.default.fmt]
 wrap_comments = true
 
-[lint]
+[profile.default.lint]
 exclude_lints = [
     "unsafe-typecast",
     "erc20-unchecked-transfer",
