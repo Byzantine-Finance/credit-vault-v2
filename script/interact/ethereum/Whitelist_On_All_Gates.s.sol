@@ -37,9 +37,10 @@ contract Whitelist_On_All_Gates is Script {
      * forge script script/interact/ethereum/Whitelist_On_All_Gates.s.sol \
      * --rpc-url $MAINNET_RPC_URL \
      * --private-key $PRIVATE_KEY \
-     * --sig "setIsWhitelistedOnAllGates(address, bool)"
-     * -- $ACCOUNT $IS_WHITELISTED \
      * --broadcast \
+     * --legacy \
+     * --sig "setIsWhitelistedOnAllGates(address, bool)" \
+     * -- $ACCOUNT $IS_WHITELISTED \
      * -vvv
      */
     function setIsWhitelistedOnAllGates(address account, bool isWhitelisted) external {
@@ -61,9 +62,10 @@ contract Whitelist_On_All_Gates is Script {
      * forge script script/interact/ethereum/Whitelist_On_All_Gates.s.sol \
      * --rpc-url $MAINNET_RPC_URL \
      * --private-key $PRIVATE_KEY \
+     * --broadcast \
+     * --legacy \
      * --sig "setIsWhitelistedBatchOnAllGates(address[], bool[])" \
      * -- $ACCOUNTS $IS_WHITELISTED \
-     * --broadcast \
      * -vvv
      */
     function setIsWhitelistedBatchOnAllGates(address[] memory accounts, bool[] memory isWhitelisted) external {
@@ -85,9 +87,10 @@ contract Whitelist_On_All_Gates is Script {
      * forge script script/interact/ethereum/Whitelist_On_All_Gates.s.sol \
      * --rpc-url $MAINNET_RPC_URL \
      * --private-key $PRIVATE_KEY \
+     * --broadcast \
+     * --legacy \
      * --sig "setIsBundlerAdapterOnAllGates(address, bool)" \
      * -- $ACCOUNT $IS_BUNDLER_ADAPTER \
-     * --broadcast \
      * -vvv
      */
     function setIsBundlerAdapterOnAllGates(address account, bool isBundlerAdapter) external {
