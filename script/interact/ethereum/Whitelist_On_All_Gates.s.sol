@@ -40,8 +40,8 @@ contract Whitelist_On_All_Gates is Script {
      * --broadcast \
      * --legacy \
      * --sig "setIsWhitelistedOnAllGates(address, bool)" \
+     * -vvv \
      * -- $ACCOUNT $IS_WHITELISTED \
-     * -vvv
      */
     function setIsWhitelistedOnAllGates(address account, bool isWhitelisted) external {
         vm.startBroadcast(privateKey);
@@ -65,8 +65,8 @@ contract Whitelist_On_All_Gates is Script {
      * --broadcast \
      * --legacy \
      * --sig "setIsWhitelistedBatchOnAllGates(address[], bool[])" \
-     * -- $ACCOUNTS $IS_WHITELISTED \
      * -vvv
+     * -- $ACCOUNTS $IS_WHITELISTED \
      */
     function setIsWhitelistedBatchOnAllGates(address[] memory accounts, bool[] memory isWhitelisted) external {
         vm.startBroadcast(privateKey);
@@ -90,8 +90,8 @@ contract Whitelist_On_All_Gates is Script {
      * --broadcast \
      * --legacy \
      * --sig "setIsBundlerAdapterOnAllGates(address, bool)" \
-     * -- $ACCOUNT $IS_BUNDLER_ADAPTER \
      * -vvv
+     * -- $ACCOUNT $IS_BUNDLER_ADAPTER \
      */
     function setIsBundlerAdapterOnAllGates(address account, bool isBundlerAdapter) external {
         vm.startBroadcast(privateKey);
