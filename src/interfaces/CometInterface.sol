@@ -2,8 +2,8 @@
 // Copyright (c) 2025 [Byzantine Finance]
 pragma solidity >=0.5.0;
 
-import "./CometMainInterface.sol";
-import "./CometExtInterface.sol";
+import {CometMainInterface} from "./CometMainInterface.sol";
+import {CometExtInterface} from "./CometExtInterface.sol";
 
 /**
  * @title Compound's Comet Interface

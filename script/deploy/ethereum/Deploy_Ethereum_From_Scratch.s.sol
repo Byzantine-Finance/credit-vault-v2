@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "../utils/Initial_Deployment_Parser.s.sol";
+import {Initial_Deployment_Parser} from "../utils/Initial_Deployment_Parser.s.sol";
 
 /**
  * @notice Script used for the first deployment on Ethereum mainnet

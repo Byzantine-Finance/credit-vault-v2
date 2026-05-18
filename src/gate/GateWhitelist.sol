@@ -3,7 +3,7 @@
 // The implementation of this contract was inspired by Morpho Vault V2, developed by the Morpho Association in 2025.
 pragma solidity ^0.8.0;
 
-import "../../src/interfaces/IGate.sol";
+import {IReceiveSharesGate, ISendSharesGate, IReceiveAssetsGate, ISendAssetsGate} from "../../src/interfaces/IGate.sol";
 
 /// @notice Morpho Bundler3 contract interface
 /// @dev Must give the address that initiates the transaction to the vault (real msg.sender)

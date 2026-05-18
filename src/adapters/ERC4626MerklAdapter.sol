@@ -77,8 +77,8 @@ contract ERC4626MerklAdapter is IERC4626MerklAdapter {
         uint256 oldAllocation = allocation();
         uint256 newAllocation = IERC4626(erc4626Vault).previewRedeem(IERC4626(erc4626Vault).balanceOf(address(this)));
 
-        // Safe casts because ERC4626 vaults bound the total supply, and allocation is less than the
-        // max total assets of the vault.
+        // forge-lint: disable-next-item(unsafe-typecast) safe because ERC4626 vaults bound the total supply, and
+        // allocation is less than the max total assets of the vault.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
@@ -95,8 +95,8 @@ contract ERC4626MerklAdapter is IERC4626MerklAdapter {
         uint256 oldAllocation = allocation();
         uint256 newAllocation = IERC4626(erc4626Vault).previewRedeem(IERC4626(erc4626Vault).balanceOf(address(this)));
 
-        // Safe casts because ERC4626 vaults bound the total supply, and allocation is less than the
-        // max total assets of the vault.
+        // forge-lint: disable-next-item(unsafe-typecast) safe because ERC4626 vaults bound the total supply, and
+        // allocation is less than the max total assets of the vault.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 

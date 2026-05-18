@@ -70,6 +70,8 @@ contract CompoundV3Adapter is ICompoundV3Adapter {
         uint256 oldAllocation = allocation();
         uint256 newAllocation = CometInterface(comet).balanceOf(address(this));
 
+        // forge-lint: disable-next-item(unsafe-typecast) safe because Compound V3 bounds the total supply of the
+        // underlying token, and allocation is less than the max total assets of the vault.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
@@ -86,6 +88,8 @@ contract CompoundV3Adapter is ICompoundV3Adapter {
         uint256 oldAllocation = allocation();
         uint256 newAllocation = CometInterface(comet).balanceOf(address(this));
 
+        // forge-lint: disable-next-item(unsafe-typecast) safe because Compound V3 bounds the total supply of the
+        // underlying token, and allocation is less than the max total assets of the vault.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
