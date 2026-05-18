@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "forge-std/Script.sol";
+import {Script} from "forge-std/Script.sol";
 import {ReceiveAssetsGate} from "../../../src/gate/ReceiveAssetsGate.sol";
 import {ReceiveSharesGate} from "../../../src/gate/ReceiveSharesGate.sol";
 import {SendAssetsGate} from "../../../src/gate/SendAssetsGate.sol";
