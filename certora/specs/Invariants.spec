@@ -1,30 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2025 Morpho Association
 
+import "../helpers/UtilityVault.spec";
+
 using Utils as Utils;
 
 methods {
-    function multicall(bytes[]) external => NONDET DELETE;
-
-    function allocation(bytes32) external returns uint256 envfree;
-    function owner() external returns (address) envfree;
-    function curator() external returns (address) envfree;
-    function adapterRegistry() external returns (address) envfree;
-    function isSentinel(address) external returns (bool) envfree;
-    function lastUpdate() external returns (uint64) envfree;
-    function totalSupply() external returns (uint256) envfree;
-    function performanceFee() external returns (uint96) envfree;
-    function performanceFeeRecipient() external returns (address) envfree;
-    function managementFee() external returns (uint96) envfree;
-    function managementFeeRecipient() external returns (address) envfree;
-    function forceDeallocatePenalty(address) external returns (uint256) envfree;
-    function absoluteCap(bytes32 id) external returns (uint256) envfree;
-    function relativeCap(bytes32 id) external returns (uint256) envfree;
-    function maxRate() external returns (uint64) envfree;
-    function allocation(bytes32 id) external returns (uint256) envfree;
-    function timelock(bytes4 selector) external returns (uint256) envfree;
-    function isAdapter(address adapter) external returns (bool) envfree;
-    function balanceOf(address) external returns (uint256) envfree;
+    function multicall(bytes[]) external => HAVOC_ALL DELETE;
 
     function _.isInRegistry(address adapter) external => ghostIsInRegistry[calledContract][adapter] expect(bool);
 
@@ -70,7 +52,7 @@ strong invariant forceDeallocatePenaltyBound(address adapter)
     forceDeallocatePenalty(adapter) <= Utils.maxForceDeallocatePenalty();
 
 strong invariant relativeCapBound(bytes32 id)
-    relativeCap(id) <= 10^18;
+    relativeCap(id) <= 10 ^ 18;
 
 strong invariant maxRateBound()
     maxRate() <= Utils.maxMaxRate();
@@ -89,36 +71,36 @@ strong invariant allocationIsInt256(bytes32 id)
 
 strong invariant registeredAdaptersAreSet()
     (forall uint256 i. i < currentContract.adapters.length => currentContract.isAdapter[currentContract.adapters[i]])
-{
-    preserved {
-        requireInvariant distinctAdapters();
+    {
+        preserved {
+            requireInvariant distinctAdapters();
+        }
     }
-}
 
 strong invariant distinctAdapters()
     forall uint256 i. forall uint256 j. (i < j && j < currentContract.adapters.length) => currentContract.adapters[j] != currentContract.adapters[i]
-{
-    preserved {
-        requireInvariant registeredAdaptersAreSet();
+    {
+        preserved {
+            requireInvariant registeredAdaptersAreSet();
+        }
     }
-}
 
 invariant virtualSharesBounds()
-    0 < currentContract.virtualShares && currentContract.virtualShares <= 10^18;
+    0 < currentContract.virtualShares && currentContract.virtualShares <= 10 ^ 18;
 
 invariant witnessForSetAdapters(address account)
     exists uint256 i. currentContract.isAdapter[account] => i < currentContract.adapters.length && currentContract.adapters[i] == account
-{
-    preserved {
-        require currentContract.adapters.length < 2 ^ 128, "would require an unrealistic amount of computation";
+    {
+        preserved {
+            require currentContract.adapters.length < 2 ^ 128, "would require an unrealistic amount of computation";
+        }
     }
-}
 
 // Note: ghostIsInRegistry makes it such that adapters can't be removed from registries. Without that, the invariant doesn't hold.
 strong invariant adaptersAreInRegistry(address account)
     adapterRegistry() != 0 => isAdapter(account) => ghostIsInRegistry[adapterRegistry()][account]
-{
-    preserved {
-        requireInvariant witnessForSetAdapters(account);
+    {
+        preserved {
+            requireInvariant witnessForSetAdapters(account);
+        }
     }
-}

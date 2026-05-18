@@ -15,14 +15,11 @@ wrap_comments = true
 
 [profile.default.lint]
 exclude_lints = [
-    "unsafe-typecast",
-    "erc20-unchecked-transfer",
     "screaming-snake-case-immutable",
-    "unaliased-plain-import",
-    "unused-import",
     "asm-keccak256",
-    "mixed-case-function",
+    "block-timestamp",
 ]
+ignore = ['test/**/*.sol']
 
 [profile.no_via_ir]
 via_ir = false

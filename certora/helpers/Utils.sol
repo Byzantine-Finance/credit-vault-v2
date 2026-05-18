@@ -2,12 +2,17 @@
 // Copyright (c) 2025 Morpho Association
 pragma solidity 0.8.28;
 
-import "../../src/libraries/ConstantsLib.sol";
-import {IMorpho, MarketParams, Id} from "../../lib/morpho-blue/src/interfaces/IMorpho.sol";
+import {
+    WAD,
+    MAX_PERFORMANCE_FEE,
+    MAX_MANAGEMENT_FEE,
+    MAX_FORCE_DEALLOCATE_PENALTY,
+    MAX_MAX_RATE
+} from "../../src/libraries/ConstantsLib.sol";
+import {MarketParams, Id} from "../../lib/morpho-blue/src/interfaces/IMorpho.sol";
 import {MarketParamsLib} from "../../lib/morpho-blue/src/libraries/MarketParamsLib.sol";
-import {MorphoBalancesLib} from "../../lib/morpho-blue/src/libraries/periphery/MorphoBalancesLib.sol";
-import {MorphoLib} from "../../lib/morpho-blue/src/libraries/periphery/MorphoLib.sol";
 import {SharesMathLib} from "../../lib/morpho-blue/src/libraries/SharesMathLib.sol";
+import {MathLib} from "../../src/libraries/MathLib.sol";
 
 interface IReturnFactory {
     function factory() external view returns (address);
@@ -18,7 +23,12 @@ contract Utils {
     using SharesMathLib for uint256;
 
     function toBytes4(bytes memory data) public pure returns (bytes4) {
+        // forge-lint: disable-next-line(unsafe-typecast)
         return bytes4(data);
+    }
+
+    function libMulDivDown(uint256 x, uint256 y, uint256 d) external pure returns (uint256) {
+        return MathLib.mulDivDown(x, y, d);
     }
 
     function wad() external pure returns (uint256) {
@@ -45,17 +55,8 @@ contract Utils {
         return MAX_MAX_RATE;
     }
 
-    function expectedSupplyAssets(IMorpho morpho, MarketParams memory marketParams, address user)
-        external
-        view
-        returns (uint256)
-    {
-        Id marketId = marketParams.id();
-        uint256 supplyShares = morpho.position(marketId, user).supplyShares;
-        (uint256 totalSupplyAssets, uint256 totalSupplyShares,,) =
-            MorphoBalancesLib.expectedMarketBalances(morpho, marketParams);
-
-        return supplyShares.toAssetsDown(totalSupplyAssets, totalSupplyShares);
+    function encodeMarketParams(MarketParams memory marketParams) external pure returns (bytes memory) {
+        return abi.encode(marketParams);
     }
 
     function decodeMarketParams(bytes memory data) external pure returns (MarketParams memory) {
@@ -64,6 +65,14 @@ contract Utils {
 
     function id(MarketParams memory marketParams) external pure returns (Id) {
         return MarketParamsLib.id(marketParams);
+    }
+
+    function wrapId(bytes32 _id) external pure returns (Id) {
+        return Id.wrap(_id);
+    }
+
+    function unwrapId(Id _id) external pure returns (bytes32) {
+        return Id.unwrap(_id);
     }
 
     function adapterId(address adapter) external pure returns (bytes32) {
