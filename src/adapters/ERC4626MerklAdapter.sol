@@ -113,9 +113,8 @@ contract ERC4626MerklAdapter is IERC4626MerklAdapter {
         require(swapParams.length == merklParams.tokens.length, InvalidData());
 
         // Call the Merkl distributor
-        IMerklDistributor(MERKL_DISTRIBUTOR).claim(
-            merklParams.users, merklParams.tokens, merklParams.amounts, merklParams.proofs
-        );
+        IMerklDistributor(MERKL_DISTRIBUTOR)
+            .claim(merklParams.users, merklParams.tokens, merklParams.amounts, merklParams.proofs);
 
         IERC20 parentVaultAsset = IERC20(IVaultV2(parentVault).asset());
         for (uint256 i; i < swapParams.length; ++i) {
@@ -158,8 +157,9 @@ contract ERC4626MerklAdapter is IERC4626MerklAdapter {
     }
 
     function realAssets() external view returns (uint256) {
-        return allocation() != 0
-            ? IERC4626(erc4626Vault).previewRedeem(IERC4626(erc4626Vault).balanceOf(address(this)))
-            : 0;
+        return
+            allocation() != 0
+                ? IERC4626(erc4626Vault).previewRedeem(IERC4626(erc4626Vault).balanceOf(address(this)))
+                : 0;
     }
 }

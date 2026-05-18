@@ -99,7 +99,9 @@ contract CompoundV3Adapter is ICompoundV3Adapter {
         (address swapper, uint256 minAmountOut, bytes memory swapData) = abi.decode(data, (address, uint256, bytes));
 
         // Verify the swapping data
-        if (swapper == comet || swapper == parentVault || swapper == cometRewards) revert SwapperCannotBeTiedContract();
+        if (swapper == comet || swapper == parentVault || swapper == cometRewards) {
+            revert SwapperCannotBeTiedContract();
+        }
         if (minAmountOut == 0) revert InvalidData();
 
         // Get assets

@@ -8,7 +8,8 @@ import {IVaultV2, IERC4626, IERC20} from "../../src/interfaces/IVaultV2.sol";
 import "../../src/libraries/ConstantsLib.sol";
 
 import {
-    ERC4626MerklAdapterFactory, IERC4626MerklAdapterFactory
+    ERC4626MerklAdapterFactory,
+    IERC4626MerklAdapterFactory
 } from "../../src/adapters/ERC4626MerklAdapterFactory.sol";
 import {IERC4626MerklAdapter} from "../../src/adapters/interfaces/IERC4626MerklAdapter.sol";
 

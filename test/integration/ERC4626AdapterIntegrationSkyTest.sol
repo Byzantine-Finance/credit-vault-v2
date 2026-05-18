@@ -35,8 +35,9 @@ contract ERC4626AdapterIntegrationSkyTest is MorphoVaultV1_1IntegrationTest {
 
         vault = _createUSDCVault();
 
-        skyAdapter =
-            MorphoVaultV1Adapter(morphoVaultV1AdapterFactory.createMorphoVaultV1Adapter(address(vault), address(sUSDC)));
+        skyAdapter = MorphoVaultV1Adapter(
+            morphoVaultV1AdapterFactory.createMorphoVaultV1Adapter(address(vault), address(sUSDC))
+        );
         expectedSkyAdapterIdData = abi.encode("this", address(skyAdapter));
         expectedSkyAdapterId = keccak256(expectedSkyAdapterIdData);
         vm.label(address(skyAdapter), "skyAdapter");

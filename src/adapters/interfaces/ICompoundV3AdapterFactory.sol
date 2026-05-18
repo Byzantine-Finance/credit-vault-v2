@@ -12,10 +12,7 @@ interface ICompoundV3AdapterFactory {
 
     /* FUNCTIONS */
 
-    function compoundV3Adapter(address parentVault, address comet, address cometRewards)
-        external
-        view
-        returns (address);
+    function compoundV3Adapter(address parentVault, address comet, address cometRewards) external view returns (address);
     function isCompoundV3Adapter(address account) external view returns (bool);
     function createCompoundV3Adapter(address parentVault, address comet, address cometRewards)
         external
