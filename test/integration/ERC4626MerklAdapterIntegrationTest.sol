@@ -4,7 +4,8 @@
 pragma solidity ^0.8.0;
 
 import {VaultV2Factory, IVaultV2Factory} from "../../src/VaultV2Factory.sol";
-import {IVaultV2, IERC4626, IERC20} from "../../src/interfaces/IVaultV2.sol";
+import {IVaultV2, IERC4626} from "../../src/interfaces/IVaultV2.sol";
+import {IERC20} from "../../src/interfaces/IERC20.sol";
 import "../../src/libraries/ConstantsLib.sol";
 
 import {
