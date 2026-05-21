@@ -11,8 +11,15 @@ interface IByzantineEurVaultAdapter is IAdapter {
     event Allocate(uint256 indexed batchId, uint256 assets, uint256 netAssets);
     event Deallocate(uint256 assets);
     event RequestWithdraw(uint256 indexed batchId, uint256 shares);
+    event ForceRequestWithdraw(
+        address indexed caller, address indexed onBehalf, uint256 shares, uint256 penaltyAssets, uint256 penaltyShares
+    );
     event SetSkimRecipient(address indexed newSkimRecipient);
+    event SetForceWithdrawPenalty(uint256 newPenalty);
     event Skim(address indexed token, uint256 amount);
+    event PullClaimableShares(uint256 shares);
+    event PullClaimableEurc(uint256 amount);
+    event ClearId(uint256 indexed batchId);
 
     /* ERRORS */
 
@@ -22,22 +29,37 @@ interface IByzantineEurVaultAdapter is IAdapter {
     error InsufficientIdle();
     error CannotSkimEurc();
     error CannotSkimBpEur();
+    error ForceWithdrawDisabled();
+    error PenaltyTooHigh();
+    error ZeroPenalty();
 
     /* FUNCTIONS */
 
+    function MAX_FORCE_WITHDRAW_PENALTY() external view returns (uint256);
     function factory() external view returns (address);
     function parentVault() external view returns (address);
     function eurVault() external view returns (address);
     function asset() external view returns (address);
     function adapterId() external view returns (bytes32);
     function skimRecipient() external view returns (address);
+    function forceWithdrawPenalty() external view returns (uint256);
+    function pendingDepositEurc(uint256 batchId) external view returns (uint256);
+    function pendingWithdrawShares(uint256 batchId) external view returns (uint256);
+    function isOpen(uint256 batchId) external view returns (bool);
+    function openBatchIds(uint256 index) external view returns (uint256);
     function openBatchIdsLength() external view returns (uint256);
     function ids() external view returns (bytes32[] memory);
     function allocation() external view returns (uint256);
     function realAssets() external view returns (uint256);
+
     function allocate(bytes memory data, uint256 assets, bytes4, address) external returns (bytes32[] memory, int256);
     function deallocate(bytes memory data, uint256 assets, bytes4, address) external returns (bytes32[] memory, int256);
     function requestWithdraw(uint256 shares) external;
     function setSkimRecipient(address newSkimRecipient) external;
+    function setForceWithdrawPenalty(uint256 newPenalty) external;
     function skim(address token) external;
+    function forceRequestWithdraw(uint256 shares, address onBehalf) external returns (uint256 penaltyShares);
+    function clearSettledBatches() external;
+    function pullClaimableShares() external;
+    function pullClaimableEurc() external;
 }
