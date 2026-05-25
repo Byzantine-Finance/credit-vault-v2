@@ -6,7 +6,6 @@ pragma solidity 0.8.28;
 import {IERC20} from "../interfaces/IERC20.sol";
 import {SafeERC20Lib} from "../libraries/SafeERC20Lib.sol";
 import {MathLib} from "../libraries/MathLib.sol";
-import {WAD} from "../libraries/ConstantsLib.sol";
 import {IByzantinePrimeEURVault} from "./interfaces/IByzantinePrimeEURVault.sol";
 import {IByzantineEurVaultAdapter} from "./interfaces/IByzantineEurVaultAdapter.sol";
 import {IVaultV2} from "../interfaces/IVaultV2.sol";
@@ -22,18 +21,10 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     address public immutable asset;
     bytes32 public immutable adapterId;
 
-    /* CONSTANTS */
-
-    /// @dev Upper bound (2%) on `forceWithdrawPenalty`
-    uint256 public constant MAX_FORCE_WITHDRAW_PENALTY = 0.02e18;
-
     /* STORAGE */
 
     address public skimRecipient;
-
-    /// @dev Penalty applied to `forceRequestWithdraw`, in WAD of the EURC value
-    ///      of the requested shares. Default 0 disables the feature.
-    uint256 public forceWithdrawPenalty;
+    address public adapterCurator;
 
     /// Mapping of batchId to pending deposit EURC
     /// @dev EURC that is deposited into the EUR vault but the deposit is not yet settled
@@ -132,27 +123,40 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
-    /// @dev Callable by parent vault curator only.
+    /// @dev Callable by adapter curator only.
     /// @dev bpEUR shares are burned immediately while withdrawn assets are transferred to the adapter at the next DNT
     /// settlement.
     function requestWithdraw(uint256 shares) external {
+        require(msg.sender == adapterCurator, Unauthorized());
+
+        // Clean up settled batches in openBatchIds
+        _clearSettledBatches();
+        // Pulls any gate-blocked bpEUR shares so the adapter can include them in the request
+        _pullClaimableShares();
+
+        uint256 batchId = _activeBatchId();
+        // Burns `shares` bpEUR from the adapter immediately and queues the request.
+        IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
+
+        if (!isOpen[batchId]) {
+            openBatchIds.push(batchId);
+            isOpen[batchId] = true;
+        }
+        pendingWithdrawShares[batchId] += shares;
+
+        emit RequestWithdraw(batchId, shares);
+    }
+
+    function setAdapterCurator(address newAdapterCurator) external {
         require(msg.sender == IVaultV2(parentVault).curator(), Unauthorized());
-        _requestWithdraw(shares);
+        adapterCurator = newAdapterCurator;
+        emit SetAdapterCurator(newAdapterCurator);
     }
 
     function setSkimRecipient(address newSkimRecipient) external {
-        require(msg.sender == IVaultV2(parentVault).curator(), Unauthorized());
+        require(msg.sender == adapterCurator, Unauthorized());
         skimRecipient = newSkimRecipient;
         emit SetSkimRecipient(newSkimRecipient);
-    }
-
-    /// @dev Sets the penalty that `forceRequestWithdraw` charges. Set to 0 to disable the feature.
-    /// @dev Callable by parent vault curator only.
-    function setForceWithdrawPenalty(uint256 newPenalty) external {
-        require(msg.sender == IVaultV2(parentVault).curator(), Unauthorized());
-        require(newPenalty <= MAX_FORCE_WITHDRAW_PENALTY, PenaltyTooHigh());
-        forceWithdrawPenalty = newPenalty;
-        emit SetForceWithdrawPenalty(newPenalty);
     }
 
     /// @dev Skims the adapter's balance of `token` and sends it to `skimRecipient`.
@@ -168,35 +172,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /* PERMISSIONLESS FUNCTIONS */
 
-    /// @notice Permissionless force-withdraw: trigger `requestWithdraw` on the EUR vault
-    ///         in exchange for burning some of `onBehalf`'s VaultV2 shares as penalty.
-    /// @dev `onBehalf` must have approved this adapter on the parent vault for at least
-    ///      `penaltyShares` VaultV2 shares before this call.
-    /// @dev The penalty is charged in EURC terms by burning `penaltyShares` on the parent vault.
-    ///      The corresponding EURC value stays inside the parent vault and accrues to the
-    ///      remaining depositors on the next interest accrual.
-    /// @dev Reverts if the caller does not own enough VaultV2 shares to cover the penalty.
-    function forceRequestWithdraw(uint256 shares, address onBehalf) external returns (uint256 penaltyShares) {
-        require(forceWithdrawPenalty > 0, ForceWithdrawDisabled());
-
-        // Trigger the async withdraw of bpEUR shares on the EUR vault
-        _requestWithdraw(shares);
-
-        // Charge the penalty in `onBehalf`'s VaultV2 shares
-        uint256 convertedAssets = IByzantinePrimeEURVault(eurVault).convertToAssets(shares);
-        uint256 penaltyAssets = convertedAssets.mulDivUp(forceWithdrawPenalty, WAD);
-        require(penaltyAssets > 0, ZeroPenalty());
-        penaltyShares = IVaultV2(parentVault).withdraw(penaltyAssets, parentVault, onBehalf);
-
-        emit ForceRequestWithdraw(msg.sender, onBehalf, shares, penaltyAssets, penaltyShares);
-    }
-
-    /// @dev Clears settled batches in openBatchIds
-    function clearSettledBatches() external {
-        _clearSettledBatches();
-    }
-
-    /// @dev Pulls gate-blocked bpEUR shares from the EUR vault
+    /// @dev Pulls gate-blocked bpEUR shares from the EUR vault and emits an event
     function pullClaimableShares() external {
         _pullClaimableShares();
     }
@@ -230,26 +206,6 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     }
 
     /* INTERNAL FUNCTIONS */
-
-    /// @dev Requests a withdraw on the EUR vault
-    function _requestWithdraw(uint256 shares) internal {
-        // Clean up settled batches in openBatchIds
-        _clearSettledBatches();
-        // Pulls any gate-blocked bpEUR shares so the adapter can include them in the request
-        _pullClaimableShares();
-
-        uint256 batchId = _activeBatchId();
-        // Burns `shares` bpEUR from the adapter immediately and queues the request.
-        IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
-
-        if (!isOpen[batchId]) {
-            openBatchIds.push(batchId);
-            isOpen[batchId] = true;
-        }
-        pendingWithdrawShares[batchId] += shares;
-
-        emit RequestWithdraw(batchId, shares);
-    }
 
     /// @dev Returns the active batch id in the Byzantine EUR vault
     function _activeBatchId() internal view returns (uint256) {
