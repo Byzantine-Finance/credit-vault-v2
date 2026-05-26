@@ -60,7 +60,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     /// @dev Allocates `assets` to the adapter and calls requestDeposit on the EUR vault.
     /// @dev Assets are transferred immediately to the adapter while bpEUR shares are minted at the next DNT settlement.
     function allocate(bytes memory data, uint256 assets, bytes4, address) external returns (bytes32[] memory, int256) {
-        require(msg.sender == parentVault, Unauthorized());
+        require(msg.sender == parentVault, NotAuthorized());
         require(data.length == 0, InvalidData());
 
         // Clean up settled batches in openBatchIds
@@ -99,7 +99,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         external
         returns (bytes32[] memory, int256)
     {
-        require(msg.sender == parentVault, Unauthorized());
+        require(msg.sender == parentVault, NotAuthorized());
         require(data.length == 0, InvalidData());
 
         // Clean up settled batches in openBatchIds
@@ -127,7 +127,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     /// @dev bpEUR shares are burned immediately while withdrawn assets are transferred to the adapter at the next DNT
     /// settlement.
     function requestWithdraw(uint256 shares) external {
-        require(msg.sender == adapterCurator, Unauthorized());
+        require(msg.sender == adapterCurator, NotAuthorized());
 
         // Clean up settled batches in openBatchIds
         _clearSettledBatches();
@@ -148,13 +148,13 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     }
 
     function setAdapterCurator(address newAdapterCurator) external {
-        require(msg.sender == IVaultV2(parentVault).curator(), Unauthorized());
+        require(msg.sender == IVaultV2(parentVault).curator(), NotAuthorized());
         adapterCurator = newAdapterCurator;
         emit SetAdapterCurator(newAdapterCurator);
     }
 
     function setSkimRecipient(address newSkimRecipient) external {
-        require(msg.sender == adapterCurator, Unauthorized());
+        require(msg.sender == IVaultV2(parentVault).owner(), NotAuthorized());
         skimRecipient = newSkimRecipient;
         emit SetSkimRecipient(newSkimRecipient);
     }
@@ -162,7 +162,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     /// @dev Skims the adapter's balance of `token` and sends it to `skimRecipient`.
     /// @dev This is useful to handle rewards that the adapter has earned.
     function skim(address token) external {
-        require(msg.sender == skimRecipient, Unauthorized());
+        require(msg.sender == skimRecipient, NotAuthorized());
         require(token != asset, CannotSkimEurc());
         require(token != eurVault, CannotSkimBpEur());
         uint256 balance = IERC20(token).balanceOf(address(this));
@@ -244,13 +244,17 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
         uint256 settledUpTo = v.currentBatchId();
         uint256 length = openBatchIds.length;
-        for (uint256 i = 0; i < length; i++) {
+        for (uint256 i = 0; i < length;) {
             uint256 batchId = openBatchIds[i];
             // Already-settled but not yet cleaned up.
-            if (batchId < settledUpTo) continue;
-            total += pendingDepositEurc[batchId];
-            uint256 burnedShares = pendingWithdrawShares[batchId];
-            if (burnedShares != 0) total += v.convertToAssets(burnedShares);
+            if (batchId >= settledUpTo) {
+                total += pendingDepositEurc[batchId];
+                uint256 burnedShares = pendingWithdrawShares[batchId];
+                if (burnedShares != 0) total += v.convertToAssets(burnedShares);
+            }
+            unchecked {
+                ++i;
+            }
         }
     }
 

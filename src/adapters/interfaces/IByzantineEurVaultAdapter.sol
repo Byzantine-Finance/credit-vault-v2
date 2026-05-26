@@ -20,7 +20,7 @@ interface IByzantineEurVaultAdapter is IAdapter {
 
     /* ERRORS */
 
-    error Unauthorized();
+    error NotAuthorized();
     error InvalidData();
     error AssetMismatch();
     error InsufficientIdle();
