@@ -6,7 +6,7 @@ pragma solidity 0.8.28;
 import {IERC20} from "../interfaces/IERC20.sol";
 import {SafeERC20Lib} from "../libraries/SafeERC20Lib.sol";
 import {MathLib} from "../libraries/MathLib.sol";
-import {IByzantinePrimeEURVault} from "./interfaces/IByzantinePrimeEURVault.sol";
+import {IByzantinePrimeEURVault} from "../interfaces/IByzantinePrimeEURVault.sol";
 import {IByzantineEurVaultAdapter} from "./interfaces/IByzantineEurVaultAdapter.sol";
 import {IVaultV2} from "../interfaces/IVaultV2.sol";
 
@@ -73,7 +73,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // amount so realAssets reflects what we actually expect back as shares
         uint256 netAssets = _netAssetsAfterDepositFee(assets);
 
-        IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
+        if (assets > 0) IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
 
         // If the batch is not open, add it to the open batch ids and set the open flag
         if (!isOpen[batchId]) {
@@ -244,7 +244,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
         uint256 settledUpTo = v.currentBatchId();
         uint256 length = openBatchIds.length;
-        for (uint256 i = 0; i < length;) {
+        for (uint256 i; i < length;) {
             uint256 batchId = openBatchIds[i];
             // Already-settled but not yet cleaned up.
             if (batchId >= settledUpTo) {
@@ -282,7 +282,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     function _clearSettledBatches() internal {
         // Get the current batch id from the EUR vault
         uint256 settledUpTo = IByzantinePrimeEURVault(eurVault).currentBatchId();
-        uint256 i = 0;
+        uint256 i;
 
         while (i < openBatchIds.length) {
             uint256 batchId = openBatchIds[i];
