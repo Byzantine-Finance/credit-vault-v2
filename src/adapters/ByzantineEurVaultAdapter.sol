@@ -36,15 +36,17 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     ///      EURC is transferred to the adapter at the next DNT settlement
     mapping(uint256 batchId => uint256) public pendingWithdrawShares;
 
-    /// Mapping of batchId to adapter's bpEUR shares at batch open
+    /// Mapping of batchId to adapter's bpEUR shares at batch open (signed)
     /// @dev (bpEUR balance + claimableShares) snapshotted when the batch is first added to `openBatchIds`.
-    ///      Adjusted on every burn (requestWithdraw) to remain comparable to the current state.
-    mapping(uint256 batchId => uint256) public sharesSnapshotAtBatch;
+    ///      Decremented on every burn (requestWithdraw) to remain comparable to the current state.
+    ///      Stored as `int256` to allow the value to go below zero when burns exceed the original snapshot
+    mapping(uint256 batchId => int256) public sharesSnapshotAtBatch;
 
-    /// Mapping of batchId to adapter's EURC at batch open
+    /// Mapping of batchId to adapter's EURC at batch open (signed)
     /// @dev (EURC balance + claimableEurc) snapshotted when the batch is first added to `openBatchIds`.
-    ///      Adjusted on every outgoing EURC transfer (deallocate) to remain comparable to the current state.
-    mapping(uint256 batchId => uint256) public eurcSnapshotAtBatch;
+    ///      Decremented on every outgoing EURC transfer (deallocate).
+    ///      Same signed-encoding rationale as `sharesSnapshotAtBatch`.
+    mapping(uint256 batchId => int256) public eurcSnapshotAtBatch;
 
     /// @dev True if `batchId` is currently in `openBatchIds`
     mapping(uint256 batchId => bool) public isOpen;
@@ -139,7 +141,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /// @dev Callable by adapter curator only.
     /// @dev bpEUR shares are burned immediately while withdrawn assets are transferred to the adapter at the next DNT
-    /// settlement.
+    ///      settlement.
     function requestWithdraw(uint256 shares) external {
         require(msg.sender == adapterCurator, NotAuthorized());
 
@@ -257,34 +259,36 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /// @dev Snapshots `(shares, eurc)` at batch open for `batchId`. Called when the batch is first added
     ///      to `openBatchIds`, so `_realAssets` can compute the passive delta attributable to this batch's
-    ///      settlement as `current - sharesSnapshotAtBatch[batchId]` (resp. `eurcSnapshotAtBatch`).
+    ///      settlement as `int256(current) - sharesSnapshotAtBatch[batchId]` (resp. `eurcSnapshotAtBatch`).
+    /// forge-lint: disable-next-item(unsafe-typecast) bpEUR and EURC supplies are bounded far below 2^255.
     function _snapshotBalancesForBatch(uint256 batchId) internal {
         (uint256 shares, uint256 eurc) = _currentBalances();
-        sharesSnapshotAtBatch[batchId] = shares;
-        eurcSnapshotAtBatch[batchId] = eurc;
+        sharesSnapshotAtBatch[batchId] = int256(shares);
+        eurcSnapshotAtBatch[batchId] = int256(eurc);
     }
 
     /// @dev Decrements every open batch's `sharesSnapshotAtBatch` by `shares` after a burn (requestWithdraw).
-    ///      Without this, the burn would artificially inflate `current - snapshot` and `_realAssets` would over-count
-    /// the lost shares.
+    ///      The signed encoding allows the snapshot to drop below zero when the burn exceeds it, allowing accounting of
+    ///      any deficit.
+    /// forge-lint: disable-next-item(unsafe-typecast) `shares` is bounded by bpEUR supply.
     function _adjustSharesSnapshotsOnBurn(uint256 shares) internal {
+        int256 sharesInt = int256(shares);
         uint256 length = openBatchIds.length;
         for (uint256 i; i < length; ++i) {
             uint256 batchId = openBatchIds[i];
-            sharesSnapshotAtBatch[batchId] =
-                sharesSnapshotAtBatch[batchId] > shares ? sharesSnapshotAtBatch[batchId] - shares : 0;
+            sharesSnapshotAtBatch[batchId] -= sharesInt;
         }
     }
 
     /// @dev Decrements every open batch's `eurcSnapshotAtBatch` by `amount` before an outgoing EURC transfer.
-    ///      Without this, the outgoing transfer would deflate `current - snapshot` and `_realAssets` would under-count
-    /// EURC.
+    ///      Same signed-encoding rationale as `_adjustSharesSnapshotsOnBurn`.
+    /// forge-lint: disable-next-item(unsafe-typecast) `amount` is bounded by EURC supply.
     function _adjustEurcSnapshotOnTransferOut(uint256 amount) internal {
+        int256 amountInt = int256(amount);
         uint256 length = openBatchIds.length;
         for (uint256 i; i < length; ++i) {
             uint256 batchId = openBatchIds[i];
-            eurcSnapshotAtBatch[batchId] =
-                eurcSnapshotAtBatch[batchId] > amount ? eurcSnapshotAtBatch[batchId] - amount : 0;
+            eurcSnapshotAtBatch[batchId] -= amountInt;
         }
     }
 
@@ -303,6 +307,10 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     ///      (and symmetrically on the withdraw side).
     ///      This residue corresponds to the hedge-partner swap fee that is only realized off-chain and cannot be
     /// pre-deducted because the per-batch netting ratio is unknown until DNT execute
+    /// @dev All `int256(uint256)` casts are bounded by token supplies (far below 2^255); the symmetric
+    ///      `uint256(int256)` casts are guarded by an explicit positivity check, so the function-level
+    ///      `disable-next-item(unsafe-typecast)` below is safe.
+    /// forge-lint: disable-next-item(unsafe-typecast)
     function _realAssets() internal view returns (uint256 total) {
         IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
 
@@ -329,16 +337,19 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
                 // Batch currently being settled by the EUR vault
                 // Track edge case where tickets are processed but batch is not closed.
                 if (isDnt && batchId == closedBelow) {
-                    // Deposit tickets
-                    uint256 sharesDelta = currentShares > sharesSnapshotAtBatch[batchId]
-                        ? currentShares - sharesSnapshotAtBatch[batchId]
+                    // Check if any deposit tickets have silently processed
+                    int256 currentSharesInt = int256(currentShares);
+                    uint256 sharesDelta = currentSharesInt > sharesSnapshotAtBatch[batchId]
+                        ? uint256(currentSharesInt - sharesSnapshotAtBatch[batchId])
                         : 0;
                     uint256 eurcDelta = sharesDelta != 0 ? v.convertToAssets(sharesDelta) : 0;
                     pendingDepEurc = pendingDepEurc > eurcDelta ? pendingDepEurc - eurcDelta : 0;
 
-                    // Withdraw tickets
-                    eurcDelta =
-                        currentEurc > eurcSnapshotAtBatch[batchId] ? currentEurc - eurcSnapshotAtBatch[batchId] : 0;
+                    // Check if any withdraw tickets have silently processed
+                    int256 currentEurcInt = int256(currentEurc);
+                    eurcDelta = currentEurcInt > eurcSnapshotAtBatch[batchId]
+                        ? uint256(currentEurcInt - eurcSnapshotAtBatch[batchId])
+                        : 0;
                     pendingWithEurc = pendingWithEurc > eurcDelta ? pendingWithEurc - eurcDelta : 0;
                 }
 
@@ -368,6 +379,8 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     /// @dev Removes entries from `openBatchIds` whose batchId have been settled, zeroing its storage.
     ///      After clearing, re-anchors the snapshots of the remaining open batches to the current state.
     /// @dev Called automatically by allocate/deallocate/requestWithdraw/pullClaimable*.
+    /// @dev The re-anchor casts are bounded by token supplies (far below 2^255).
+    // forge-lint: disable-next-item(unsafe-typecast)
     function _clearSettledBatches() internal {
         // Get the current batch id from the EUR vault
         uint256 closedBelow = IByzantinePrimeEURVault(eurVault).currentBatchId();
@@ -399,10 +412,12 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         uint256 remaining = openBatchIds.length;
         if (anyCleared && remaining != 0) {
             (uint256 bp, uint256 eurc) = _currentBalances();
+            int256 bpInt = int256(bp);
+            int256 eurcInt = int256(eurc);
             for (i = 0; i < remaining; ++i) {
                 uint256 batchId = openBatchIds[i];
-                sharesSnapshotAtBatch[batchId] = bp;
-                eurcSnapshotAtBatch[batchId] = eurc;
+                sharesSnapshotAtBatch[batchId] = bpInt;
+                eurcSnapshotAtBatch[batchId] = eurcInt;
             }
         }
     }

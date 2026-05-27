@@ -38,8 +38,8 @@ interface IByzantineEurVaultAdapter is IAdapter {
     function skimRecipient() external view returns (address);
     function pendingDepositEurc(uint256 batchId) external view returns (uint256);
     function pendingWithdrawShares(uint256 batchId) external view returns (uint256);
-    function sharesSnapshotAtBatch(uint256 batchId) external view returns (uint256);
-    function eurcSnapshotAtBatch(uint256 batchId) external view returns (uint256);
+    function sharesSnapshotAtBatch(uint256 batchId) external view returns (int256);
+    function eurcSnapshotAtBatch(uint256 batchId) external view returns (int256);
     function isOpen(uint256 batchId) external view returns (bool);
     function openBatchIds(uint256 index) external view returns (uint256);
     function openBatchIdsLength() external view returns (uint256);
