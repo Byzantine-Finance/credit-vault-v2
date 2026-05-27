@@ -6,6 +6,26 @@ pragma solidity >=0.5.0;
 import {IAdapter} from "../../interfaces/IAdapter.sol";
 
 interface IByzantineEurVaultAdapter is IAdapter {
+    /* STRUCTS */
+
+    /// @dev Per-batch accounting state.
+    struct BatchAccounting {
+        /// @dev EURC sent to the EUR vault for this batch's deposit but not yet
+        ///      settled (bpEUR shares minted at the next DNT).
+        uint256 pendingDepositEurc;
+        /// @dev bpEUR burned for this batch's withdraw but EURC not yet received.
+        uint256 pendingWithdrawShares;
+        /// @dev Snapshot of (bpEUR balance + claimableShares) at batch open,
+        ///      decremented on every burn. Goes below zero when burns exceed the open snapshot.
+        int256 sharesSnapshotAtBatch;
+        /// @dev Snapshot of (EURC balance + claimableEurc) at batch open,
+        ///      decremented on every outgoing EURC transfer (deallocate / requestDeposit).
+        ///      Goes below zero when transfers exceed the open snapshot.
+        int256 eurcSnapshotAtBatch;
+        /// @dev True if the batch is currently tracked in `openBatchIds`.
+        bool isOpen;
+    }
+
     /* EVENTS */
 
     event Allocate(uint256 indexed batchId, uint256 assets, uint256 netAssets);
@@ -37,11 +57,16 @@ interface IByzantineEurVaultAdapter is IAdapter {
     function adapterId() external view returns (bytes32);
     function adapterCurator() external view returns (address);
     function skimRecipient() external view returns (address);
-    function pendingDepositEurc(uint256 batchId) external view returns (uint256);
-    function pendingWithdrawShares(uint256 batchId) external view returns (uint256);
-    function sharesSnapshotAtBatch(uint256 batchId) external view returns (int256);
-    function eurcSnapshotAtBatch(uint256 batchId) external view returns (int256);
-    function isOpen(uint256 batchId) external view returns (bool);
+    function batchAccounting(uint256 batchId)
+        external
+        view
+        returns (
+            uint256 pendingDepositEurc,
+            uint256 pendingWithdrawShares,
+            int256 sharesSnapshotAtBatch,
+            int256 eurcSnapshotAtBatch,
+            bool isOpen
+        );
     function openBatchIds(uint256 index) external view returns (uint256);
     function openBatchIdsLength() external view returns (uint256);
     function ids() external view returns (bytes32[] memory);

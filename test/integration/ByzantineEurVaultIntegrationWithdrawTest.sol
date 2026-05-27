@@ -95,8 +95,9 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         // Shares burned immediately.
         assertEq(eurVault.balanceOf(address(adapter)), 0, "shares burned");
         // Pending withdraw recorded against the active batch.
-        assertEq(adapter.pendingWithdrawShares(batchId), shares, "pendingWithdrawShares");
-        assertTrue(adapter.isOpen(batchId), "batch should be open");
+        (, uint256 pendingWith,,, bool isOpen) = adapter.batchAccounting(batchId);
+        assertEq(pendingWith, shares, "pendingWithdrawShares");
+        assertTrue(isOpen, "batch should be open");
     }
 
     function testRequestWithdrawEmitsEvent(uint256 assets) public {

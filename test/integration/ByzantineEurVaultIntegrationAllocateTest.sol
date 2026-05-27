@@ -35,8 +35,9 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
 
-        assertEq(adapter.pendingDepositEurc(batchId), assets, "pendingDepositEurc (no fee)");
-        assertTrue(adapter.isOpen(batchId), "batch should be open");
+        (uint256 pendingDep,,,, bool isOpen) = adapter.batchAccounting(batchId);
+        assertEq(pendingDep, assets, "pendingDepositEurc (no fee)");
+        assertTrue(isOpen, "batch should be open");
         assertEq(adapter.openBatchIdsLength(), 1, "openBatchIds length");
         assertEq(adapter.openBatchIds(0), batchId, "openBatchIds[0]");
     }
@@ -55,7 +56,8 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         // pendingDepositEurc should reflect the net assets after the deposit fee (mulDivUp).
         uint256 expectedFee = (assets * feeBps + 9999) / 10_000;
         uint256 expectedNet = assets - expectedFee;
-        assertEq(adapter.pendingDepositEurc(batchId), expectedNet, "pendingDepositEurc reflects fee");
+        (uint256 pendingDep,,,,) = adapter.batchAccounting(batchId);
+        assertEq(pendingDep, expectedNet, "pendingDepositEurc reflects fee");
     }
 
     function testAllocateReturnsAllocationDeltaEqualToRealAssetsChange(uint256 assets) public {
@@ -87,7 +89,8 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vm.stopPrank();
 
         // Same batch (no settlement between calls), should accumulate exactly once in openBatchIds.
-        assertEq(adapter.pendingDepositEurc(batchId), a1 + a2, "pendingDepositEurc accumulates");
+        (uint256 pendingDep,,,,) = adapter.batchAccounting(batchId);
+        assertEq(pendingDep, a1 + a2, "pendingDepositEurc accumulates");
         assertEq(adapter.openBatchIdsLength(), 1, "single openBatchId");
     }
 
@@ -109,8 +112,10 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", a2);
 
-        assertEq(adapter.pendingDepositEurc(batchId1), a1, "batch1 pending");
-        assertEq(adapter.pendingDepositEurc(batchId2), a2, "batch2 pending");
+        (uint256 pending1,,,,) = adapter.batchAccounting(batchId1);
+        (uint256 pending2,,,,) = adapter.batchAccounting(batchId2);
+        assertEq(pending1, a1, "batch1 pending");
+        assertEq(pending2, a2, "batch2 pending");
         assertEq(adapter.openBatchIdsLength(), 2, "two open batches");
     }
 
