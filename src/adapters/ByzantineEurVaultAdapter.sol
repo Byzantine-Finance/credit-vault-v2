@@ -140,6 +140,46 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     }
 
     /// @dev Callable by adapter curator only.
+    /// @dev Deposits `assets` of idle EURC held by the adapter into the EUR vault to earn yield.
+    ///      The EURC leaves the adapter immediately while bpEUR shares are minted at the next DNT settlement.
+    function requestDeposit(uint256 assets) external {
+        require(msg.sender == adapterCurator, NotAuthorized());
+
+        // Clean up settled batches in openBatchIds
+        _clearSettledBatches();
+
+        // Pulls any claimable EURC so the adapter can include it in the deposit
+        _pullClaimableEurc();
+
+        // Only allowed to deposit if the adapter has enough idle EURC
+        require(IERC20(asset).balanceOf(address(this)) >= assets, InsufficientIdle());
+
+        // Transfer the assets to the EUR vault. Reverts on zero assets via the vault's own check.
+        IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
+
+        // `assets` left the adapter to the EUR vault.
+        // Adjust EURC snapshots of existing open batches so future settlement-delta calculations remain consistent.
+        _adjustEurcSnapshotOnTransferOut(assets);
+
+        // Get the active batch id
+        uint256 batchId = _activeBatchId();
+
+        // The EUR vault deducts depositFeeBps on requestDeposit. Record the net
+        // amount so realAssets reflects what we actually expect back as shares
+        uint256 netAssets = _netAssetsAfterDepositFee(assets);
+        pendingDepositEurc[batchId] += netAssets;
+
+        // If the batch is not open, snapshot balances and add it to the open batch ids.
+        if (!isOpen[batchId]) {
+            _snapshotBalancesForBatch(batchId);
+            openBatchIds.push(batchId);
+            isOpen[batchId] = true;
+        }
+
+        emit RequestDeposit(batchId, assets, netAssets);
+    }
+
+    /// @dev Callable by adapter curator only.
     /// @dev bpEUR shares are burned immediately while withdrawn assets are transferred to the adapter at the next DNT
     ///      settlement.
     function requestWithdraw(uint256 shares) external {

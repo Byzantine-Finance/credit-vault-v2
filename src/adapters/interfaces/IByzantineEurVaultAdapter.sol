@@ -10,6 +10,7 @@ interface IByzantineEurVaultAdapter is IAdapter {
 
     event Allocate(uint256 indexed batchId, uint256 assets, uint256 netAssets);
     event Deallocate(uint256 assets);
+    event RequestDeposit(uint256 indexed batchId, uint256 assets, uint256 netAssets);
     event RequestWithdraw(uint256 indexed batchId, uint256 shares);
     event SetAdapterCurator(address indexed newAdapterCurator);
     event SetSkimRecipient(address indexed newSkimRecipient);
@@ -49,6 +50,7 @@ interface IByzantineEurVaultAdapter is IAdapter {
 
     function allocate(bytes memory data, uint256 assets, bytes4, address) external returns (bytes32[] memory, int256);
     function deallocate(bytes memory data, uint256 assets, bytes4, address) external returns (bytes32[] memory, int256);
+    function requestDeposit(uint256 assets) external;
     function requestWithdraw(uint256 shares) external;
     function setAdapterCurator(address newAdapterCurator) external;
     function setSkimRecipient(address newSkimRecipient) external;
