@@ -280,8 +280,8 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /// @dev Snapshots `(shares, eurc)` at batch open for `batchId`. Called when the batch is first added
     ///      to `openBatchIds`, so `_realAssets` can compute the passive delta attributable to this batch's
-    ///      settlement as `int256(current) - sharesSnapshotAtBatch[batchId]` (resp. `eurcSnapshotAtBatch`).
-    /// forge-lint: disable-next-item(unsafe-typecast) bpEUR and EURC supplies are bounded far below 2^255.
+    ///      settlement as `int256(current) - acc.sharesSnapshotAtBatch` (resp. `acc.eurcSnapshotAtBatch`).
+    // forge-lint: disable-next-item(unsafe-typecast) bpEUR and EURC supplies are bounded far below 2^255.
     function _snapshotBalancesForBatch(uint256 batchId) internal {
         (uint256 shares, uint256 eurc) = _currentBalances();
         BatchAccounting storage acc = batchAccounting[batchId];
@@ -292,7 +292,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     /// @dev Decrements every open batch's `sharesSnapshotAtBatch` by `shares` after a burn (requestWithdraw).
     ///      The signed encoding allows the snapshot to drop below zero when the burn exceeds it, allowing accounting of
     ///      any deficit.
-    /// forge-lint: disable-next-item(unsafe-typecast) `shares` is bounded by bpEUR supply.
+    // forge-lint: disable-next-item(unsafe-typecast) `shares` is bounded by bpEUR supply.
     function _adjustSharesSnapshotsOnBurn(uint256 shares) internal {
         int256 sharesInt = int256(shares);
         uint256 length = openBatchIds.length;
@@ -306,7 +306,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /// @dev Decrements every open batch's `eurcSnapshotAtBatch` by `amount` before an outgoing EURC transfer.
     ///      Same signed-encoding rationale as `_adjustSharesSnapshotsOnBurn`.
-    /// forge-lint: disable-next-item(unsafe-typecast) `amount` is bounded by EURC supply.
+    // forge-lint: disable-next-item(unsafe-typecast) `amount` is bounded by EURC supply.
     function _adjustEurcSnapshotOnTransferOut(uint256 amount) internal {
         int256 amountInt = int256(amount);
         uint256 length = openBatchIds.length;
@@ -327,16 +327,17 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     ///      (C) and (D) are reduced by the portion that has already been minted/transferred to the adapter
     ///      This is detected via `current - snapshot` deltas and avoids the
     ///      double-counting that would otherwise occur between ticket processing and batch close.
-    /// @dev Known imprecision: during the active-settlement window of a batch, `realAssets()` may over-state by at
-    /// most: imprecision = (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) ×
-    /// pendingDepositEurc[currentBatchId]
-    ///      (and symmetrically on the withdraw side).
-    ///      This residue corresponds to the hedge-partner swap fee that is only realized off-chain and cannot be
-    /// pre-deducted because the per-batch netting ratio is unknown until DNT execute
+    /// @dev Known imprecision: during the active-settlement window of a batch, `realAssets()` may
+    ///      transiently over-state by at most
+    ///        (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) ×
+    ///        batchAccounting[currentBatchId].pendingDepositEurc
+    ///      (and symmetrically on the withdraw side). This residue corresponds to the hedge-partner
+    ///      swap fee that is only realized off-chain and cannot be pre-deducted because the per-batch
+    ///      netting ratio is unknown until DNT execute.
     /// @dev All `int256(uint256)` casts are bounded by token supplies (far below 2^255); the symmetric
     ///      `uint256(int256)` casts are guarded by an explicit positivity check, so the function-level
     ///      `disable-next-item(unsafe-typecast)` below is safe.
-    /// forge-lint: disable-next-item(unsafe-typecast)
+    // forge-lint: disable-next-item(unsafe-typecast)
     function _realAssets() internal view returns (uint256 total) {
         IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
 
@@ -409,7 +410,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     ///      After clearing, re-anchors the snapshots of the remaining open batches to the current state.
     /// @dev Called automatically by allocate/deallocate/requestWithdraw/pullClaimable*.
     /// @dev The re-anchor casts are bounded by token supplies (far below 2^255).
-    // forge-lint: disable-next-item(unsafe-typecast)
+    /// forge-lint: disable-next-item(unsafe-typecast)
     function _clearSettledBatches() internal {
         // Get the current batch id from the EUR vault
         uint256 closedBelow = IByzantinePrimeEURVault(eurVault).currentBatchId();
