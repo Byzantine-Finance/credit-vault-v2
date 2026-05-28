@@ -35,7 +35,7 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
 
-        (uint256 pendingDep,,,, bool isOpen) = adapter.batchAccounting(batchId);
+        (uint128 pendingDep,,,, bool isOpen) = adapter.batchAccounting(batchId);
         assertEq(pendingDep, assets, "pendingDepositEurc (no fee)");
         assertTrue(isOpen, "batch should be open");
         assertEq(adapter.openBatchIdsLength(), 1, "openBatchIds length");
@@ -56,7 +56,7 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         // pendingDepositEurc should reflect the net assets after the deposit fee (mulDivUp).
         uint256 expectedFee = (assets * feeBps + 9999) / 10_000;
         uint256 expectedNet = assets - expectedFee;
-        (uint256 pendingDep,,,,) = adapter.batchAccounting(batchId);
+        (uint128 pendingDep,,,,) = adapter.batchAccounting(batchId);
         assertEq(pendingDep, expectedNet, "pendingDepositEurc reflects fee");
     }
 
@@ -89,7 +89,7 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vm.stopPrank();
 
         // Same batch (no settlement between calls), should accumulate exactly once in openBatchIds.
-        (uint256 pendingDep,,,,) = adapter.batchAccounting(batchId);
+        (uint128 pendingDep,,,,) = adapter.batchAccounting(batchId);
         assertEq(pendingDep, a1 + a2, "pendingDepositEurc accumulates");
         assertEq(adapter.openBatchIdsLength(), 1, "single openBatchId");
     }
@@ -112,8 +112,8 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", a2);
 
-        (uint256 pending1,,,,) = adapter.batchAccounting(batchId1);
-        (uint256 pending2,,,,) = adapter.batchAccounting(batchId2);
+        (uint128 pending1,,,,) = adapter.batchAccounting(batchId1);
+        (uint128 pending2,,,,) = adapter.batchAccounting(batchId2);
         assertEq(pending1, a1, "batch1 pending");
         assertEq(pending2, a2, "batch2 pending");
         assertEq(adapter.openBatchIdsLength(), 2, "two open batches");

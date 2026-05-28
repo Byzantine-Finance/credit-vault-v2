@@ -66,7 +66,8 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // amount so realAssets reflects what we actually expect back as shares
         uint256 netAssets = _netAssetsAfterDepositFee(assets);
         BatchAccounting storage acc = batchAccounting[batchId];
-        acc.pendingDepositEurc += netAssets;
+        // forge-lint: disable-next-line(unsafe-typecast) `netAssets` is bounded by EURC supply.
+        acc.pendingDepositEurc += uint128(netAssets);
 
         // If the batch is not open, snapshot balances and add it to the open batch ids.
         if (!acc.isOpen) {
@@ -147,7 +148,8 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // amount so realAssets reflects what we actually expect back as shares
         uint256 netAssets = _netAssetsAfterDepositFee(assets);
         BatchAccounting storage acc = batchAccounting[batchId];
-        acc.pendingDepositEurc += netAssets;
+        // forge-lint: disable-next-line(unsafe-typecast) `netAssets` is bounded by EURC supply.
+        acc.pendingDepositEurc += uint128(netAssets);
 
         // If the batch is not open, snapshot balances and add it to the open batch ids.
         if (!acc.isOpen) {
@@ -286,7 +288,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         (uint256 shares, uint256 eurc) = _currentBalances();
         BatchAccounting storage acc = batchAccounting[batchId];
         acc.sharesSnapshotAtBatch = int256(shares);
-        acc.eurcSnapshotAtBatch = int256(eurc);
+        acc.eurcSnapshotAtBatch = int128(int256(eurc));
     }
 
     /// @dev Decrements every open batch's `sharesSnapshotAtBatch` by `shares` after a burn (requestWithdraw).
@@ -308,7 +310,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     ///      Same signed-encoding rationale as `_adjustSharesSnapshotsOnBurn`.
     // forge-lint: disable-next-item(unsafe-typecast) `amount` is bounded by EURC supply.
     function _adjustEurcSnapshotOnTransferOut(uint256 amount) internal {
-        int256 amountInt = int256(amount);
+        int128 amountInt = int128(int256(amount));
         uint256 length = openBatchIds.length;
         for (uint256 i; i < length;) {
             batchAccounting[openBatchIds[i]].eurcSnapshotAtBatch -= amountInt;
@@ -441,7 +443,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         if (anyCleared && remaining != 0) {
             (uint256 bp, uint256 eurc) = _currentBalances();
             int256 bpInt = int256(bp);
-            int256 eurcInt = int256(eurc);
+            int128 eurcInt = int128(int256(eurc));
             for (i = 0; i < remaining;) {
                 BatchAccounting storage acc = batchAccounting[openBatchIds[i]];
                 acc.sharesSnapshotAtBatch = bpInt;

@@ -12,16 +12,16 @@ interface IByzantineEurVaultAdapter is IAdapter {
     struct BatchAccounting {
         /// @dev EURC sent to the EUR vault for this batch's deposit but not yet
         ///      settled (bpEUR shares minted at the next DNT).
-        uint256 pendingDepositEurc;
+        uint128 pendingDepositEurc;
+        /// @dev Snapshot of (EURC balance + claimableEurc) at batch open,
+        ///      decremented on every outgoing EURC transfer (deallocate / requestDeposit).
+        ///      Goes below zero when transfers exceed the open snapshot.
+        int128 eurcSnapshotAtBatch;
         /// @dev bpEUR burned for this batch's withdraw but EURC not yet received.
         uint256 pendingWithdrawShares;
         /// @dev Snapshot of (bpEUR balance + claimableShares) at batch open,
         ///      decremented on every burn. Goes below zero when burns exceed the open snapshot.
         int256 sharesSnapshotAtBatch;
-        /// @dev Snapshot of (EURC balance + claimableEurc) at batch open,
-        ///      decremented on every outgoing EURC transfer (deallocate / requestDeposit).
-        ///      Goes below zero when transfers exceed the open snapshot.
-        int256 eurcSnapshotAtBatch;
         /// @dev True if the batch is currently tracked in `openBatchIds`.
         bool isOpen;
     }
@@ -61,10 +61,10 @@ interface IByzantineEurVaultAdapter is IAdapter {
         external
         view
         returns (
-            uint256 pendingDepositEurc,
+            uint128 pendingDepositEurc,
+            int128 eurcSnapshotAtBatch,
             uint256 pendingWithdrawShares,
             int256 sharesSnapshotAtBatch,
-            int256 eurcSnapshotAtBatch,
             bool isOpen
         );
     function openBatchIds(uint256 index) external view returns (uint256);
