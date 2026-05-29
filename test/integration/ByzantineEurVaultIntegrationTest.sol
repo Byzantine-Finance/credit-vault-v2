@@ -111,9 +111,9 @@ contract ByzantineEurVaultIntegrationTest is Test {
 
     /* HELPERS */
 
-    /// @dev Gate-open path:Composes the two-phase finalize primitives into one call that settles the active EUR-vault
-    ///      batch for the adapter only. By default, it uses the gate-open path (`setReceiveSharesBlocked(false)` and
-    /// `setReceiveAssetsBlocked(false)`). @dev Use this when the test does NOT need to observe claimable state.
+    /// @dev Gate-open path: Composes the two-phase finalize primitives into one call that settles the active EUR-vault
+    ///      batch for the adapter only.
+    /// @dev Use this when the test does NOT need to observe claimable state.
     function _settleAdapterBatch() internal {
         address[] memory r = new address[](1);
         r[0] = address(adapter);

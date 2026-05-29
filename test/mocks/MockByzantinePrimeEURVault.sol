@@ -27,13 +27,28 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     uint256 private constant ONE_SHARE = 1e18;
     uint256 private constant ONE_STABLE = 1e6;
 
-    address public immutable underlying;
+    /// @dev The asset that the vault holds and manages.
+    address public immutable asset;
+
+    /// @dev Deposit fee in basis points, applied at request time.
     uint16 internal _depositFeeBps;
+    /// @dev Withdraw fee in basis points, applied at settlement on the gross PPS-derived payout.
+    uint16 internal _withdrawFeeBps;
+    /// @dev Hedge swap fee in basis points, applied as a FLAT HAIRCUT on every deposit and
+    ///      withdrawal at settlement.
+    /// @dev Simplification vs real: the real vault charges this fee ONLY on the unmatched net flow
+    ///      within a batch (matched deposits/withdrawals pay nothing).
+    ///      This mock applies the haircut flatly to every ticket.
+    ///      It thus OVER-charges relative to the real when deposits and withdrawals offset within a batch.
+    uint16 internal _hedgeSwapFeeBps;
+
+    /// @dev The state of the vault.
     VaultState public override vaultState;
+    /// @dev The current batch id.
     uint256 public override currentBatchId = 1;
 
     /// @dev Total EURC the vault recognizes as backing the outstanding bpEUR supply.
-    ///      Differs from `IERC20(underlying).balanceOf(address(this))` because it excludes:
+    ///      Differs from `IERC20(asset).balanceOf(address(this))` because it excludes:
     ///      - per-batch queued deposits (not yet minted into shares),
     ///      - per-batch already-burned shares' future payouts (still owed),
     ///      - collected fees.
@@ -51,17 +66,16 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     /// @dev Per-(batch, receiver) breakdown of `batchWithdrawShares`.
     mapping(uint256 batchId => mapping(address receiver => uint256)) public batchUserWithdraw;
 
-    /// @dev Gate-blocked deposit settlements park the minted bpEUR here (keyed by receiver). Drained by
-    ///      `claimDepositShares(receiver)`. Mirrors the real vault's `claimableShares[owner]`.
-    mapping(address owner => uint256) internal _claimableShares;
+    /// @dev Gate-blocked deposit settlements park the minted bpEUR here.
+    ///      For simplicity, we assume `owner == receiver` in every test scenario.
+    mapping(address receiver => uint256) internal _claimableShares;
 
-    /// @dev Gate-blocked withdraw settlements park the EURC payout here (keyed by receiver). Drained by
-    ///      `claimWithdraw(receiver)`. Mirrors the real vault's `claimableEurc[owner]`.
-    mapping(address owner => uint256) internal _claimableEurc;
+    /// @dev Gate-blocked withdraw settlements park the EURC payout here.
+    ///      For simplicity, we assume `owner == receiver` in every test scenario.
+    mapping(address receiver => uint256) internal _claimableEurc;
 
     /// @dev Gate flags. When `true`, settlement parks the relevant asset into the matching `claimable*`
     ///      mapping instead of transferring directly to the receiver.
-    /// @dev Simply toggle the global gate flags to simulate gate-blocked scenarios.
     bool public receiveSharesBlocked;
     bool public receiveAssetsBlocked;
 
@@ -71,19 +85,28 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     uint256 internal _dntSupplySnapshot;
     uint256 internal _dntBatchId;
 
+    /* CONSTRUCTOR */
+
     constructor(address asset_, uint16 depositFeeBps_) ERC20("Byzantine Prime EUR", "bpEUR") {
-        underlying = asset_;
+        asset = asset_;
         _depositFeeBps = depositFeeBps_;
     }
 
     /* VIEW FUNCTIONS */
 
-    function asset() external view override returns (address) {
-        return underlying;
-    }
-
     function depositFeeBps() external view override returns (uint16) {
         return _depositFeeBps;
+    }
+
+    /// @dev Not on `IByzantinePrimeEURVault` (the adapter does not read this directly), but exposed
+    ///      so tests can fuzz / assert against it.
+    function withdrawFeeBps() external view returns (uint16) {
+        return _withdrawFeeBps;
+    }
+
+    /// @dev Not on `IByzantinePrimeEURVault`. Exposed for tests to fuzz / assert against.
+    function hedgeSwapFeeBps() external view returns (uint16) {
+        return _hedgeSwapFeeBps;
     }
 
     function nextBatchId() external view override returns (uint256) {
@@ -99,26 +122,19 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     }
 
     /// @dev When a DNT snapshot is active, conversions read the locked NAV/supply so
-    ///      PPS quotes are stable across chunked finalization — exactly like the real vault's
-    ///      `_conversionSupplyForPps`. Outside DNT, they use live state.
+    ///      PPS quotes are stable across chunked finalization
     function convertToAssets(uint256 shares) public view override returns (uint256) {
-        if (_dntBatchId != 0) {
-            if (_dntSupplySnapshot == 0) return (shares * ONE_STABLE) / ONE_SHARE;
-            return (shares * _dntNavSnapshot) / _dntSupplySnapshot;
-        }
-        uint256 supply = totalSupply();
+        uint256 supply = _conversionSupply();
         if (supply == 0) return (shares * ONE_STABLE) / ONE_SHARE;
-        return (shares * totalEurcBacking) / supply;
+        uint256 nav = _dntBatchId != 0 ? _dntNavSnapshot : totalEurcBacking;
+        return (shares * nav) / supply;
     }
 
     function convertToShares(uint256 assets) public view returns (uint256) {
-        if (_dntBatchId != 0) {
-            if (_dntSupplySnapshot == 0 || _dntNavSnapshot == 0) return (assets * ONE_SHARE) / ONE_STABLE;
-            return (assets * _dntSupplySnapshot) / _dntNavSnapshot;
-        }
-        uint256 supply = totalSupply();
-        if (supply == 0 || totalEurcBacking == 0) return (assets * ONE_SHARE) / ONE_STABLE;
-        return (assets * supply) / totalEurcBacking;
+        uint256 supply = _conversionSupply();
+        uint256 nav = _dntBatchId != 0 ? _dntNavSnapshot : totalEurcBacking;
+        if (supply == 0 || nav == 0) return (assets * ONE_SHARE) / ONE_STABLE;
+        return (assets * supply) / nav;
     }
 
     /* EXTERNAL FUNCTIONS */
@@ -127,7 +143,7 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     ///      Active batch matches the adapter's `_activeBatchId`: currentBatchId when idle, nextBatchId in DNT.
     function requestDeposit(uint256 assets, address receiver) external override {
         if (assets == 0) revert ZeroAssets();
-        IERC20(underlying).transferFrom(msg.sender, address(this), assets);
+        IERC20(asset).transferFrom(msg.sender, address(this), assets);
         uint256 fee = _mulDivUp(assets, _depositFeeBps, 10_000);
         uint256 net = assets - fee;
         uint256 batchId = _targetBatchId();
@@ -137,9 +153,6 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     }
 
     /// @dev burns `shares` from `owner` immediately and records the queued payout for `receiver`.
-    ///      Note: in the real vault, share price is preserved because the future EURC owed is locked at settlement.
-    ///      We faithfully reproduce that by not decreasing `totalEurcBacking` here; payouts come out of backing
-    ///      at settlement time.
     function requestWithdraw(uint256 shares, address receiver, address owner) external override {
         if (shares == 0) revert ZeroShares();
         if (owner != msg.sender) {
@@ -152,6 +165,7 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         batchUserWithdraw[batchId][receiver] += shares;
     }
 
+    /// @dev Reads `_claimableShares[receiver]` and transfers the shares to `receiver`.
     function claimDepositShares(address receiver) external override {
         uint256 amount = _claimableShares[receiver];
         require(amount > 0, "nothing claimable");
@@ -159,11 +173,12 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         _transfer(address(this), receiver, amount);
     }
 
+    /// @dev Same `owner == receiver` convention as `claimDepositShares`.
     function claimWithdraw(address receiver) external override {
         uint256 amount = _claimableEurc[receiver];
         require(amount > 0, "nothing claimable");
         _claimableEurc[receiver] = 0;
-        IERC20(underlying).transfer(receiver, amount);
+        IERC20(asset).transfer(receiver, amount);
     }
 
     /* FX HEDGING FUNCTIONS */
@@ -184,48 +199,60 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     ///      closing the batch. Per-receiver routing matches the real vault's gate logic — when
     ///      `receiveSharesBlocked[rec]` is `true`, shares are minted to this contract and credited as
     ///      `claimableShares[rec]`; otherwise they are minted directly to the receiver.
+    /// @dev Swap fee (`_hedgeSwapFeeBps`) is applied as a flat haircut on every deposit:
+    ///      `effectiveAssets = net * (10_000 - feeBps) / 10_000`.
     function processDepositChunk(address[] calldata receivers, uint256 maxTickets) external {
         require(vaultState == VaultState.DntInProgress, "no DNT");
         uint256 batchId = _dntBatchId;
+        uint256 swapFee = _hedgeSwapFeeBps;
         uint256 processed = 0;
         for (uint256 i; i < receivers.length && processed < maxTickets; ++i) {
             address rec = receivers[i];
             uint256 net = batchUserDeposit[batchId][rec];
             if (net == 0) continue;
-            // Shares minted using locked snapshot
-            uint256 sharesToMint =
-                _dntSupplySnapshot == 0 ? (net * ONE_SHARE) / ONE_STABLE : (net * _dntSupplySnapshot) / _dntNavSnapshot;
+            uint256 effectiveAssets = swapFee == 0 ? net : (net * (10_000 - swapFee)) / 10_000;
+            uint256 sharesToMint = _dntSupplySnapshot == 0
+                ? (effectiveAssets * ONE_SHARE) / ONE_STABLE
+                : (effectiveAssets * _dntSupplySnapshot) / _dntNavSnapshot;
             if (receiveSharesBlocked) {
                 _mint(address(this), sharesToMint);
                 _claimableShares[rec] += sharesToMint;
             } else {
                 _mint(rec, sharesToMint);
             }
-            totalEurcBacking += net;
+            totalEurcBacking += effectiveAssets;
             batchDepositEurc[batchId] -= net;
             delete batchUserDeposit[batchId][rec];
             ++processed;
         }
     }
 
-    /// @dev Mirrors `_processWithdrawTicketsChunk`: pays EURC out using the locked snapshot
-    ///      WITHOUT closing the batch. The shares were already burned at `requestWithdraw` time; this call
-    ///      only releases the matching EURC payout. Per-receiver routing mirrors the share path: blocked
-    ///      receivers get the EURC parked in `claimableEurc`, the rest get it transferred directly.
+    /// @dev Mirrors `_processWithdrawTicketsChunk`: pays EURC out using the locked snapshot WITHOUT
+    ///      closing the batch. Same per-receiver aggregation as `processDepositChunk`.
+    /// @dev Fees compose in real-vault order: swap fee (`_hedgeSwapFeeBps`) is applied first as a
+    ///      flat haircut on the gross PPS-derived `owed`, then the protocol withdraw fee (`_withdrawFeeBps`)
+    ///      is applied on the post-swap amount.
+    ///      `totalEurcBacking` decreases by the gross `owed` — both the swap loss and the protocol
+    ///      fee stay on the vault's token balance.
     function processWithdrawChunk(address[] calldata receivers, uint256 maxTickets) external {
         require(vaultState == VaultState.DntInProgress, "no DNT");
         uint256 batchId = _dntBatchId;
         uint256 supplyAtBurn = _dntSupplySnapshot;
+        uint256 swapFee = _hedgeSwapFeeBps;
+        uint256 feeBps = _withdrawFeeBps;
         uint256 processed = 0;
         for (uint256 i; i < receivers.length && processed < maxTickets; ++i) {
             address rec = receivers[i];
             uint256 userShares = batchUserWithdraw[batchId][rec];
             if (userShares == 0) continue;
             uint256 owed = supplyAtBurn == 0 ? 0 : (userShares * _dntNavSnapshot) / supplyAtBurn;
+            uint256 afterSwap = swapFee == 0 ? owed : (owed * (10_000 - swapFee)) / 10_000;
+            uint256 fee = feeBps == 0 ? 0 : _mulDivUp(afterSwap, feeBps, 10_000);
+            uint256 toPay = afterSwap - fee;
             if (receiveAssetsBlocked) {
-                _claimableEurc[rec] += owed;
+                _claimableEurc[rec] += toPay;
             } else {
-                IERC20(underlying).transfer(rec, owed);
+                IERC20(asset).transfer(rec, toPay);
             }
             totalEurcBacking -= owed;
             batchWithdrawShares[batchId] -= userShares;
@@ -260,6 +287,8 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         receiveAssetsBlocked = blocked;
     }
 
+    /* SETTER FUNCTIONS */
+
     /// @dev Low-level state-only toggle. Does NOT populate the DNT snapshot — use `executeDnt` for that.
     ///      Useful when a test only needs the `_activeBatchId` selector to switch to `nextBatchId`.
     function setVaultState(VaultState s) external {
@@ -281,10 +310,27 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         _depositFeeBps = bps;
     }
 
+    /// @dev Set the withdraw fee basis points
+    function setWithdrawFeeBps(uint16 bps) external {
+        _withdrawFeeBps = bps;
+    }
+
+    /// @dev Set the hedge swap fee basis points
+    function setHedgeSwapFeeBps(uint16 bps) external {
+        _hedgeSwapFeeBps = bps;
+    }
+
     /* INTERNAL FUNCTIONS */
 
     function _targetBatchId() internal view returns (uint256) {
         return vaultState == VaultState.NormalIdle ? currentBatchId : currentBatchId + 1;
+    }
+
+    /// @dev Mirrors the real vault's `_conversionSupplyForPps`: during DNT return the snapshot supply;
+    ///      outside DNT, should include pending withdraw.
+    function _conversionSupply() internal view returns (uint256) {
+        if (_dntBatchId != 0) return _dntSupplySnapshot;
+        return totalSupply() + batchWithdrawShares[currentBatchId];
     }
 
     function _mulDivUp(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {

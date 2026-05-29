@@ -158,4 +158,121 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         // After settlement, the EURC is sitting idle on the adapter (gate-open path) - realAssets must still match.
         assertApproxEqAbs(adapter.realAssets(), realAssetsBefore, 1, "realAssets unchanged on settlement");
     }
+
+    /* WITHDRAW AND HEDGE SWAP FEES (4 SCENARIOS) */
+
+    /// @notice Scenario 1: Withdraw fee deducted at settlement - gate-open: adapter receives `gross - fee`,
+    ///         the fee EURC stays on the EUR vault.
+    function testWithdrawFeeReducesPayoutByFeeBps(uint256 assets, uint16 feeBps) public {
+        feeBps = uint16(bound(feeBps, 1, 1_000)); // up to 10%
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+        eurVault.setWithdrawFeeBps(feeBps);
+
+        // Seed the adapter with bpEUR via a normal deposit cycle (no deposit fee).
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAdapterBatch();
+
+        // Burn all of the adapter's bpEUR.
+        uint256 shares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+
+        // Settle on the gate-open path: EURC routed directly to the adapter, less the fee.
+        _settleAdapterBatch();
+
+        // mulDivUp formula matches the mock's `_mulDivUp(owed, feeBps, 10_000)`.
+        uint256 expectedFee = (assets * feeBps + 9_999) / 10_000;
+        uint256 expectedPayout = assets - expectedFee;
+
+        assertEq(eurc.balanceOf(address(adapter)), expectedPayout, "adapter receives gross - fee");
+        assertEq(eurc.balanceOf(address(eurVault)), expectedFee, "fee EURC retained on EUR vault");
+        // The bpEUR supply is now empty and so is the backing — fees do not back any outstanding share.
+        assertEq(eurVault.totalEurcBacking(), 0, "backing fully drained by gross owed");
+    }
+
+    /// @notice Scenario 2: Hedge swap fee only: Adapter receives `gross * (1 - swapFeeBps/10000)` EURC at settlement.
+    ///         The swap-loss EURC stays on the EUR vault contract balance.
+    function testSwapFeeHaircutsWithdrawPayout(uint256 assets, uint16 swapFeeBps) public {
+        swapFeeBps = uint16(bound(swapFeeBps, 1, 1_000));
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+
+        // Seed the adapter without swap fee — set it AFTER the deposit cycle so only the withdraw
+        // leg is haircut. Isolates the withdraw-side effect.
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAdapterBatch();
+        eurVault.setHedgeSwapFeeBps(swapFeeBps);
+
+        uint256 shares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+        _settleAdapterBatch();
+
+        uint256 expectedPayout = (assets * (10_000 - swapFeeBps)) / 10_000;
+
+        assertEq(eurc.balanceOf(address(adapter)), expectedPayout, "payout = gross * (1 - swapFee)");
+        assertEq(eurc.balanceOf(address(eurVault)), assets - expectedPayout, "swap loss retained on EUR vault");
+        // No outstanding bpEUR left; backing fully drained.
+        assertEq(eurVault.totalEurcBacking(), 0, "backing drained by gross");
+    }
+
+    /// @notice Scenario 3: Composition of swap fee + protocol withdraw fee.
+    ///         Adapter receives `(gross * (1 - swapFee)) * (1 - protoFee_ceil)`.
+    function testSwapFeeAndWithdrawFeeCompose(uint256 assets, uint16 swapFeeBps, uint16 withdrawFeeBps) public {
+        swapFeeBps = uint16(bound(swapFeeBps, 1, 500));
+        withdrawFeeBps = uint16(bound(withdrawFeeBps, 1, 500));
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAdapterBatch();
+
+        eurVault.setHedgeSwapFeeBps(swapFeeBps);
+        eurVault.setWithdrawFeeBps(withdrawFeeBps);
+
+        uint256 shares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+        _settleAdapterBatch();
+
+        // Match the on-chain composition: swap (rounded down) → protocol fee (ceiling).
+        uint256 afterSwap = (assets * (10_000 - swapFeeBps)) / 10_000;
+        uint256 protoFee = (afterSwap * withdrawFeeBps + 9_999) / 10_000;
+        uint256 expectedPayout = afterSwap - protoFee;
+
+        assertEq(eurc.balanceOf(address(adapter)), expectedPayout, "payout = (gross * (1-swap)) - protoFee");
+        // Vault retains swap loss + protocol fee on its EURC balance.
+        assertEq(eurc.balanceOf(address(eurVault)), assets - expectedPayout, "vault retains swap loss + proto fee");
+    }
+
+    /// @notice Scenario 4: Withdraw fee deducted at settlement - gate-blocked
+    ///         The post-fee EURC is parked as claimable on the EUR vault instead of being transferred.
+    function testWithdrawFeeReducesClaimableEurc(uint256 assets, uint16 feeBps) public {
+        feeBps = uint16(bound(feeBps, 1, 1_000));
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+        eurVault.setWithdrawFeeBps(feeBps);
+
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAdapterBatch();
+
+        uint256 shares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+
+        // Gate-blocked: payout parked as claimable, less the fee.
+        _settleAdapterBatchToClaimable();
+
+        uint256 expectedFee = (assets * feeBps + 9_999) / 10_000;
+        uint256 expectedClaimable = assets - expectedFee;
+
+        assertEq(eurc.balanceOf(address(adapter)), 0, "adapter has no idle EURC");
+        assertEq(eurVault.claimableEurc(address(adapter)), expectedClaimable, "claimable = gross - fee");
+        assertEq(eurc.balanceOf(address(eurVault)), assets, "vault holds fee + claimable on its balance");
+    }
 }

@@ -42,37 +42,16 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         assertEq(adapter.openBatchIds(0), batchId, "openBatchIds[0]");
     }
 
-    function testAllocateAppliesDepositFeeToPendingAmount(uint256 assets, uint16 feeBps) public {
-        feeBps = uint16(bound(feeBps, 1, 1_000)); // up to 10%
-        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
-        eurVault.setDepositFeeBps(feeBps);
-
-        vault.deposit(assets, address(this));
-
-        uint256 batchId = _activeBatchId();
-        vm.prank(allocator);
-        vault.allocate(address(adapter), hex"", assets);
-
-        // pendingDepositEurc should reflect the net assets after the deposit fee (mulDivUp).
-        uint256 expectedFee = (assets * feeBps + 9999) / 10_000;
-        uint256 expectedNet = assets - expectedFee;
-        (uint128 pendingDep,,,,) = adapter.batchAccounting(batchId);
-        assertEq(pendingDep, expectedNet, "pendingDepositEurc reflects fee");
-    }
-
-    function testAllocateReturnsAllocationDeltaEqualToRealAssetsChange(uint256 assets) public {
+    /* PARENT VAULT ALLOCATION */
+    /// @notice `vault.allocate` applies the adapter's returned delta so `caps.allocation` matches `realAssets()`.
+    function testAllocateSyncsParentVaultAllocation(uint256 assets) public {
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
         vault.deposit(assets, address(this));
-
-        uint256 realAssetsBefore = adapter.realAssets();
 
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
 
-        // No fee in this test path, so realAssets should equal assets after allocate.
-        uint256 realAssetsAfter = adapter.realAssets();
-        assertEq(realAssetsAfter - realAssetsBefore, assets, "realAssets delta == assets");
-        assertEq(adapter.allocation(), realAssetsAfter, "vault allocation tracks adapter allocation");
+        assertEq(adapter.allocation(), adapter.realAssets(), "parent vault allocation matches realAssets");
     }
 
     function testAllocateMultipleTimesSameBatchAccumulates(uint256 a1, uint256 a2) public {
@@ -135,23 +114,47 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vault.allocate(address(adapter), hex"", assets);
     }
 
-    function testRealAssetsConsistentAfterSettlement(uint256 assets) public {
+    /* DEPOSIT FEE */
+    function testAllocateAppliesDepositFeeToPendingAmount(uint256 assets, uint16 feeBps) public {
+        feeBps = uint16(bound(feeBps, 1, 1_000)); // up to 10%
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+        eurVault.setDepositFeeBps(feeBps);
 
         vault.deposit(assets, address(this));
 
+        uint256 batchId = _activeBatchId();
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
 
-        // Before settlement, realAssets counts pending deposit.
-        assertEq(adapter.realAssets(), assets, "realAssets before settlement");
+        // pendingDepositEurc should reflect the net assets after the deposit fee (mulDivUp).
+        uint256 expectedFee = (assets * feeBps + 9999) / 10_000;
+        uint256 expectedNet = assets - expectedFee;
+        (uint128 pendingDep,,,,) = adapter.batchAccounting(batchId);
+        assertEq(pendingDep, expectedNet, "pendingDepositEurc reflects fee");
+    }
 
-        // Settle - mints bpEUR directly to the adapter
+    /// @notice Hedge swap fee only: haircuts the depositor's effective EURC at settlement. The
+    ///         adapter ends up with shares for `assets * (1 - swapFeeBps/10000)` worth, the swap-loss
+    ///         EURC stays on the EUR vault.
+    function testSwapFeeHaircutsDepositEffectiveAssets(uint256 assets, uint16 swapFeeBps) public {
+        swapFeeBps = uint16(bound(swapFeeBps, 1, 1_000));
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+        eurVault.setHedgeSwapFeeBps(swapFeeBps);
+
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
         _settleAdapterBatch();
 
-        // After settlement, the pending entry is stale but realAssets still equals `assets`:
-        // - claimableShares converted-back are exactly `assets`
-        // - pendingDepositEurc[batchId] is still recorded but is skipped because batchId < currentBatchId
-        assertEq(adapter.realAssets(), assets, "realAssets after settlement");
+        uint256 expectedEffective = (assets * (10_000 - swapFeeBps)) / 10_000;
+
+        // Adapter holds shares for the EFFECTIVE (post-haircut) amount.
+        assertEq(eurVault.balanceOf(address(adapter)), expectedEffective * BPEUR_PER_EURC, "shares = effective * scale");
+        // Backing equals the effective amount; swap loss is excluded.
+        assertEq(eurVault.totalEurcBacking(), expectedEffective, "backing = effective");
+        // Gross EURC stays on the EUR vault contract balance (swap loss + effective backing).
+        assertEq(eurc.balanceOf(address(eurVault)), assets, "vault token balance retains gross");
+        // realAssets reflects the post-haircut value via convertToAssets at the unchanged PPS.
+        assertEq(adapter.realAssets(), expectedEffective, "realAssets = effective");
     }
 }
