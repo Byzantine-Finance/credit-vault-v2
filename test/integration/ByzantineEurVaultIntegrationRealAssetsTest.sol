@@ -4,6 +4,7 @@
 pragma solidity ^0.8.0;
 
 import "./ByzantineEurVaultIntegrationTest.sol";
+import {MathLib} from "../../src/libraries/MathLib.sol";
 
 /// @notice Testing `ByzantineEurVaultAdapter.realAssets()`
 /// @dev    `realAssets` is the adapter's source of truth for the parent vault's `accrueInterest` loop.
@@ -11,11 +12,17 @@ import "./ByzantineEurVaultIntegrationTest.sol";
 ///           (A) idle EURC on the adapter + EURC claimable on the EUR vault
 ///           (B) `convertToAssets(bpEUR balance + claimableShares)` - the value of the bpEUR position
 ///           (C) per-open-batch pending deposit EURC - summed over open EUR-vault batches not yet settled (corrected
-/// via the snapshot-delta during partial finalize) (D) per-open-batch `convertToAssets(pending withdraw shares)` -
-/// summed over the same set (same correction)
-///         Each test below builds a clean state for one specific branch (or combination) and asserts
-///         `realAssets()` equals the expected value at that point in the flow.
+/// via the snapshot-delta during partial finalize) 
+///           (D) per-open-batch `convertToAssets(pending withdraw shares)` - summed over the same set (same correction)
+///
+/// @dev ±1-wei tolerances: convertToAssets() floors (rounds down). 
+///      A value that is exact in real terms (e.g. SEED) is reconstructed from
+///      two independently-floored share→EURC conversions — convertToAssets(a) + convertToAssets(b)
+///      can be 1 wei below convertToAssets(a + b). Tolerance only bites when W is not a clean
+///      multiple of BPEUR_PER_EURC.
 contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
+    using MathLib for uint256;
+
     /* ------------------------------------------------------------------ */
     /*  Constants used by the normal-flow tests                           */
     /* ------------------------------------------------------------------ */
@@ -431,7 +438,7 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         eurVault.processWithdrawChunk(receivers, type(uint256).max);
 
         // EURC paid = withdraw shares valued at seed PPS (W * SEED / seedShares).
-        uint256 expectedEurcPaid = (withdrawShares * SEED) / seedShares;
+        uint256 expectedEurcPaid = withdrawShares.mulDivDown(SEED, seedShares);
         assertEq(eurc.balanceOf(address(adapter)), expectedEurcPaid, "phase 5: EURC paid to adapter");
         {
             (uint128 pd,, uint256 pw,,) = adapter.batchAccounting(batchN);
@@ -532,7 +539,7 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         // ≥ 1 EURC worth so payout > 0; ≤ seedShares − 1 leaves ≥ 1 raw share on the adapter so the
         // post-deallocate allocation stays strictly positive (VaultV2 invariant).
         withdrawShares = bound(withdrawShares, BPEUR_PER_EURC, seedShares - 1);
-        uint256 expectedPayout = (withdrawShares * SEED) / seedShares;
+        uint256 expectedPayout = withdrawShares.mulDivDown(SEED, seedShares);
         vm.assume(expectedPayout > 0);
 
         // ---- Phase 0: seed via a full prior batch (closes cleanly) ----
@@ -587,6 +594,110 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
             SEED - expectedPayout,
             1,
             "phase 5: realAssets = SEED - payout even with eurcSnapshot[N] < 0"
+        );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Swap-fee residue during partial finalize (m=1 only)               */
+    /* ------------------------------------------------------------------ */
+    //
+    // The `_realAssets` NatSpec documents a known transient over-state during the active settlement
+    // window of a batch with a non-zero hedge swap fee. The documented upper bound is:
+    //
+    //  residue_max = (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) ×
+    //                 batchAccounting[currentBatchId].pendingDepositEurc
+
+    /// @notice Deposit-side swap-fee residue: between `processDepositChunk` and `closeBatch`,
+    ///         `realAssets()` reports the PRE-haircut deposit amount even though the on-chain swap
+    ///         loss has already been realized into the EUR vault's reserve. `closeBatch` resolves it.
+    /// @dev    Walk-through (D = depositAmount, x = swapFeeBps / 10_000):
+    ///           0) `allocate(D)` opens the batch with a pending deposit of D.
+    ///           1) `executeDnt` starts settlement.
+    ///           2) `processDepositChunk` applies the haircut: adapter ends up with `effective = D * (1 - x)`.
+    ///           3) Before close, `realAssets()` over-states by the residue `D - effective`.
+    ///           4) `closeBatch` drops the batch from accounting: `realAssets()` becomes exact (= effective).
+    function testSwapFeeResidueOnDepositChunkVanishesAtClose(uint256 depositAmount, uint16 swapFeeBps) public {
+        swapFeeBps = uint16(bound(uint256(swapFeeBps), 1, 1_000)); // [1bps, 10%], matches existing test bounds
+        // Deposit amount, short for "D"
+        depositAmount = bound(depositAmount, 1e6, 100e6); // [1, 100] EURC
+        eurVault.setHedgeSwapFeeBps(swapFeeBps);
+
+        // Pre-compute the post-haircut "effective" deposit the mock will mint shares against.
+        uint256 expectedEffective = depositAmount.mulDivDown(10_000 - uint256(swapFeeBps), 10_000);
+        // Actual residue == ceil(depositAmount × swapFeeBps / 10_000)
+        uint256 expectedResidue = depositAmount - expectedEffective;
+        // Ceiling of the formula documented in NatSpec
+        uint256 residue_max = depositAmount.mulDivUp(swapFeeBps, 10_000);
+        // Floor of the formula
+        uint256 formulaResidueFloor = depositAmount.mulDivDown(swapFeeBps, 10_000);
+
+        // ---- Phase 0: allocate(D) opens batch N — adapter starts EMPTY ----
+        vault.deposit(depositAmount, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", depositAmount);
+        // Pre-DNT: realAssets counts the pending deposit at face value (fee not yet applied).
+        assertEq(adapter.realAssets(), depositAmount, "phase 0: pre-DNT realAssets = D (full pending)");
+
+        // ---- Phase 1: executeDnt — sets _dntSupplySnapshot = 0 (fallback PPS path for conversions) ----
+        eurVault.executeDnt();
+        assertEq(adapter.realAssets(), depositAmount, "phase 1: realAssets unchanged at DNT entry");
+
+        // ---- Phase 2: silent deposit chunk — adapter receives `effective × BPEUR_PER_EURC` bpEUR ----
+        address[] memory receivers = new address[](1);
+        receivers[0] = address(adapter);
+        eurVault.processDepositChunk(receivers, type(uint256).max);
+        // Adapter's bpEUR position only carries the post-haircut value; the swap-loss EURC sits on the
+        // EUR vault contract balance.
+        assertEq(
+            IERC20(address(eurVault)).balanceOf(address(adapter)),
+            expectedEffective * BPEUR_PER_EURC,
+            "phase 2: bpEUR balance = effective * scale (haircut applied)"
+        );
+
+        // ---- Phase 3: load-bearing checks on the mid-DNT residue ----
+        uint256 realAssetsMidDnt = adapter.realAssets();
+
+        // (a) realAssets STILL reports the pre-haircut value — the snapshot-delta cancels only the
+        //     post-haircut share value out of `pendingDepositEurc=D`, leaving exactly `D − effective`.
+        assertEq(realAssetsMidDnt, depositAmount, "phase 3: realAssets over-states (= pre-haircut D)");
+
+        // (b) The over-state is positive
+        assertGt(realAssetsMidDnt - expectedEffective, 0, "phase 3: residue strictly positive when fee > 0");
+
+        // (c) The over-state equals the EXACT haircut the mock realized off-chain.
+        assertEq(
+            realAssetsMidDnt - expectedEffective,
+            expectedResidue,
+            "phase 3: residue == D - effective (the realized off-chain haircut)"
+        );
+
+        // (d) Documented upper bound holds: residue ≤ ceil(residue_max). The floor of the formula is
+        //     ≤ the actual residue ≤ the ceil — both are tight to within 1 wei.
+        assertLe(
+            realAssetsMidDnt - expectedEffective,
+            residue_max,
+            "phase 3: residue <= ceil(residue_max) - formula tightly bounds the over-state"
+        );
+        assertLe(
+            formulaResidueFloor,
+            realAssetsMidDnt - expectedEffective,
+            "phase 3: residue >= floor(residue_max) - formula lower bound holds"
+        );
+
+        // ---- Phase 4: closeBatch — batch N drops below closedBelow, residue VANISHES ----
+        eurVault.closeBatch();
+        uint256 realAssetsPostClose = adapter.realAssets();
+
+        // Now realAssets reports the adapter's true holdings: only the post-haircut bpEUR position.
+        assertEq(
+            realAssetsPostClose, expectedEffective, "phase 4: post-close realAssets = effective (exact, no residue)"
+        );
+        // The delta between mid-DNT and post-close IS the residue — proof that closeBatch was the
+        // event that removed it.
+        assertEq(
+            realAssetsMidDnt - realAssetsPostClose,
+            expectedResidue,
+            "phase 4: closeBatch removed EXACTLY the residue (mid-DNT minus post-close)"
         );
     }
 }
