@@ -275,4 +275,72 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         assertEq(eurVault.claimableEurc(address(adapter)), expectedClaimable, "claimable = gross - fee");
         assertEq(eurc.balanceOf(address(eurVault)), assets, "vault holds fee + claimable on its balance");
     }
+
+    /* PERMISSIONLESS pullClaimableShares / pullClaimableEurc */
+
+    /// @notice The permissionless `pullClaimableShares()` pulls gate-blocked deposit shares out
+    ///         of the EUR vault onto the adapter as live bpEUR.
+    function testPullClaimableSharesPullsDepositAndClearsSettledBatch(uint256 assets) public {
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+
+        // Seed bpEUR via the gate-blocked deposit path so shares park as claimableShares and the deposit
+        // batch settles + closes (leaving it listed in openBatchIds until the next clear).
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAdapterBatchToClaimable();
+
+        uint256 expectedShares = assets * BPEUR_PER_EURC;
+
+        // Pre-state: full deposit sits as claimable shares; the settled deposit batch is still listed.
+        assertEq(eurVault.claimableShares(address(adapter)), expectedShares, "claimable == full deposit (no fees)");
+        assertEq(eurVault.balanceOf(address(adapter)), 0, "no live bpEUR before pull");
+        assertEq(adapter.openBatchIdsLength(), 1, "settled batch still listed pre-pull");
+
+        // Permissionless: anyone may call
+        address anyone = makeAddr("anyone");
+        vm.expectEmit(false, false, false, true, address(adapter));
+        emit IByzantineEurVaultAdapter.PullClaimableShares(expectedShares);
+        vm.prank(anyone);
+        adapter.pullClaimableShares();
+
+        assertEq(eurVault.balanceOf(address(adapter)), expectedShares, "shares pulled to adapter");
+        assertEq(eurVault.claimableShares(address(adapter)), 0, "claimable drained");
+        assertEq(adapter.openBatchIdsLength(), 0, "settled batch cleared as side-effect");
+        assertEq(adapter.realAssets(), assets, "realAssets reflects the pulled bpEUR position");
+    }
+
+    /// @notice The permissionless `pullClaimableEurc()` pulls a gate-blocked withdraw payout out
+    ///         of the EUR vault onto the adapter as idle EURC.
+    function testPullClaimableEurcPullsPayoutAndClearsSettledBatch(uint256 assets) public {
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+
+        // Seed bpEUR, then withdraw on the gate-blocked path so the payout parks as claimableEurc and the
+        // withdraw batch settles + closes (leaving it listed in openBatchIds until the next clear).
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAdapterBatch();
+        uint256 shares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+        _settleAdapterBatchToClaimable();
+
+        // Pre-state: full payout sits as claimable (no fees); the settled withdraw batch is still listed.
+        assertEq(eurVault.claimableEurc(address(adapter)), assets, "claimable == full payout (no fees)");
+        assertEq(eurc.balanceOf(address(adapter)), 0, "no idle EURC before pull");
+        assertEq(adapter.openBatchIdsLength(), 1, "settled batch still listed pre-pull");
+
+        // Permissionless: anyone may call
+        address anyone = makeAddr("anyone");
+        vm.expectEmit(false, false, false, true, address(adapter));
+        emit IByzantineEurVaultAdapter.PullClaimableEurc(assets);
+        vm.prank(anyone);
+        adapter.pullClaimableEurc();
+
+        assertEq(eurc.balanceOf(address(adapter)), assets, "payout pulled to adapter idle");
+        assertEq(eurVault.claimableEurc(address(adapter)), 0, "claimable drained");
+        assertEq(adapter.openBatchIdsLength(), 0, "settled batch cleared as side-effect");
+        assertEq(adapter.realAssets(), assets, "realAssets reflects the pulled idle EURC");
+    }
 }
