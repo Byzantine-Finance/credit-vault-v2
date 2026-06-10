@@ -22,6 +22,14 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         adapter.requestWithdraw(0);
     }
 
+    function testRequestWithdrawMoreThanHeldReverts(uint256 shares) public {
+        shares = bound(shares, 1, type(uint128).max);
+        // The adapter holds no bpEUR: any non-zero request must revert before touching the EUR vault.
+        vm.prank(adapterCurator);
+        vm.expectRevert(IByzantineEurVaultAdapter.InsufficientShares.selector);
+        adapter.requestWithdraw(shares);
+    }
+
     /* setAdapterCurator ACCESS CONTROL & STATE */
 
     function testSetAdapterCuratorOnlyVaultCurator(address invalidCaller, address newAdapterCurator) public {
@@ -59,11 +67,11 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vm.assume(newAdapterCurator != adapterCurator);
         vm.assume(newAdapterCurator != address(0));
 
-        // Set up bpEUR on the adapter via the gate-open path so we can call requestWithdraw immediately.
+        // Set up bpEUR on the adapter via a settled + swept deposit cycle.
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
         uint256 shares = eurVault.balanceOf(address(adapter));
 
         // Rotate the curator.
@@ -84,7 +92,7 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch(); // gate-open: shares on adapter directly
+        _settleAndSweep(); // shares on adapter
 
         uint256 shares = eurVault.balanceOf(address(adapter));
         uint256 batchId = _activeBatchId();
@@ -92,12 +100,14 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
 
-        // Shares burned immediately.
-        assertEq(eurVault.balanceOf(address(adapter)), 0, "shares burned");
-        // Pending withdraw recorded against the active batch.
-        (,, uint256 pendingWith,, bool isOpen) = adapter.batchAccounting(batchId);
-        assertEq(pendingWith, shares, "pendingWithdrawShares");
-        assertTrue(isOpen, "batch should be open");
+        // Shares moved to the position and burned immediately.
+        assertEq(eurVault.balanceOf(address(adapter)), 0, "adapter shares gone");
+        assertEq(adapter.positionsLength(), 1, "one live position");
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertEq(eurVault.balanceOf(address(position)), 0, "position shares burned");
+        assertEq(position.pendingShares(), shares, "pendingShares");
+        assertEq(position.pendingEurc(), 0, "withdraw position has no pendingEurc");
+        assertEq(position.batchId(), batchId, "position batchId");
     }
 
     function testRequestWithdrawEmitsEvent(uint256 assets) public {
@@ -106,36 +116,41 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         uint256 shares = eurVault.balanceOf(address(adapter));
         uint256 batchId = _activeBatchId();
 
-        vm.expectEmit(true, false, false, true, address(adapter));
-        emit IByzantineEurVaultAdapter.RequestWithdraw(batchId, shares);
+        // topic1 (the position address) is not checked: it is derived from the CREATE2 nonce.
+        vm.expectEmit(false, true, false, true, address(adapter));
+        emit IByzantineEurVaultAdapter.RequestWithdraw(address(0), batchId, shares);
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
     }
 
-    function testRequestWithdrawPullsClaimableSharesFirst(uint256 assets) public {
-        // Specifically tests the adapter's `_pullClaimableShares` invocation inside `requestWithdraw`:
-        // when shares are gate-blocked into `claimableShares`, the adapter must pull them in before burning.
+    function testRequestWithdrawSweepsClaimableSharesFirst(uint256 assets) public {
+        // When deposit shares are gate-blocked into `claimableShares` under a settled deposit position,
+        // `requestWithdraw` must sweep them home before burning.
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatchToClaimable(); // gate-blocked path: shares stay as claimable
+        _settleAdapterBatchToClaimable(); // gate-blocked path: shares stay claimable under the position
 
-        // Pre-state: nothing on adapter; everything sitting on the EUR vault as claimable.
-        assertGt(eurVault.claimableShares(address(adapter)), 0, "should have claimable shares");
-        assertEq(eurVault.balanceOf(address(adapter)), 0, "no adapter shares before pull");
+        // Pre-state: nothing on the adapter; everything sitting as claimable under the deposit position.
+        address depositPosition = adapter.positions(0);
+        uint256 claimable = eurVault.claimableShares(depositPosition);
+        assertGt(claimable, 0, "should have claimable shares");
+        assertEq(eurVault.balanceOf(address(adapter)), 0, "no adapter shares before sweep");
 
-        uint256 claimable = eurVault.claimableShares(address(adapter));
         vm.prank(adapterCurator);
-        adapter.requestWithdraw(claimable); // adapter pulls then burns in one shot
+        adapter.requestWithdraw(claimable); // adapter sweeps then burns in one shot
 
-        assertEq(eurVault.balanceOf(address(adapter)), 0, "shares pulled and burned");
-        assertEq(eurVault.claimableShares(address(adapter)), 0, "claimable shares drained");
+        assertEq(eurVault.balanceOf(address(adapter)), 0, "shares swept and burned");
+        assertEq(eurVault.claimableShares(depositPosition), 0, "claimable shares drained");
+        // The settled deposit position was dropped; only the fresh withdraw position remains.
+        assertEq(adapter.positionsLength(), 1, "one live position (the new withdraw)");
+        assertEq(EurVaultPosition(adapter.positions(0)).pendingShares(), claimable, "pendingShares == swept claimable");
     }
 
     function testRequestWithdrawRealAssetsPreservesValueBeforeAndAfterSettlement(uint256 assets) public {
@@ -143,7 +158,7 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         uint256 realAssetsBefore = adapter.realAssets();
         uint256 shares = eurVault.balanceOf(address(adapter));
@@ -151,18 +166,22 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
 
-        // realAssets must not change just from queuing a withdrawal (shares -> pendingWithdrawShares value).
+        // realAssets must not change just from queuing a withdrawal (shares -> pendingShares value).
         assertApproxEqAbs(adapter.realAssets(), realAssetsBefore, 1, "realAssets unchanged on request");
 
         _settleAdapterBatch();
-        // After settlement, the EURC is sitting idle on the adapter (gate-open path) - realAssets must still match.
+        // After settlement, the EURC sits on the settled position (gate-open path) — realAssets must still match.
         assertApproxEqAbs(adapter.realAssets(), realAssetsBefore, 1, "realAssets unchanged on settlement");
+
+        adapter.sweepSettled(type(uint256).max);
+        // After the sweep, the EURC is idle on the adapter — realAssets must still match.
+        assertApproxEqAbs(adapter.realAssets(), realAssetsBefore, 1, "realAssets unchanged after sweep");
     }
 
     /* WITHDRAW AND HEDGE SWAP FEES (4 SCENARIOS) */
 
-    /// @notice Scenario 1: Withdraw fee deducted at settlement - gate-open: adapter receives `gross - fee`,
-    ///         the fee EURC stays on the EUR vault.
+    /// @notice Scenario 1: Withdraw fee deducted at settlement - gate-open: adapter receives `gross - fee`
+    ///         after the sweep, the fee EURC stays on the EUR vault.
     function testWithdrawFeeReducesPayoutByFeeBps(uint256 assets, uint16 feeBps) public {
         feeBps = uint16(bound(feeBps, 1, 1_000)); // up to 10%
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
@@ -172,15 +191,15 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         // Burn all of the adapter's bpEUR.
         uint256 shares = eurVault.balanceOf(address(adapter));
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
 
-        // Settle on the gate-open path: EURC routed directly to the adapter, less the fee.
-        _settleAdapterBatch();
+        // Settle on the gate-open path and sweep the payout home.
+        _settleAndSweep();
 
         // mulDivUp formula matches the mock's `_mulDivUp(owed, feeBps, 10_000)`.
         uint256 expectedFee = (assets * feeBps + 9_999) / 10_000;
@@ -203,13 +222,13 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
         eurVault.setHedgeSwapFeeBps(swapFeeBps);
 
         uint256 shares = eurVault.balanceOf(address(adapter));
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         uint256 expectedPayout = (assets * (10_000 - swapFeeBps)) / 10_000;
 
@@ -229,7 +248,7 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         eurVault.setHedgeSwapFeeBps(swapFeeBps);
         eurVault.setWithdrawFeeBps(withdrawFeeBps);
@@ -237,7 +256,7 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         uint256 shares = eurVault.balanceOf(address(adapter));
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         // Match the on-chain composition: swap (rounded down) → protocol fee (ceiling).
         uint256 afterSwap = (assets * (10_000 - swapFeeBps)) / 10_000;
@@ -250,7 +269,7 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
     }
 
     /// @notice Scenario 4: Withdraw fee deducted at settlement - gate-blocked
-    ///         The post-fee EURC is parked as claimable on the EUR vault instead of being transferred.
+    ///         The post-fee EURC is parked as claimable (under the position) instead of being transferred.
     function testWithdrawFeeReducesClaimableEurc(uint256 assets, uint16 feeBps) public {
         feeBps = uint16(bound(feeBps, 1, 1_000));
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
@@ -259,88 +278,94 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         uint256 shares = eurVault.balanceOf(address(adapter));
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
 
-        // Gate-blocked: payout parked as claimable, less the fee.
+        // Gate-blocked: payout parked as claimable under the withdraw position, less the fee.
         _settleAdapterBatchToClaimable();
 
         uint256 expectedFee = (assets * feeBps + 9_999) / 10_000;
         uint256 expectedClaimable = assets - expectedFee;
 
+        address position = adapter.positions(0);
         assertEq(eurc.balanceOf(address(adapter)), 0, "adapter has no idle EURC");
-        assertEq(eurVault.claimableEurc(address(adapter)), expectedClaimable, "claimable = gross - fee");
+        assertEq(eurVault.claimableEurc(position), expectedClaimable, "claimable = gross - fee");
         assertEq(eurc.balanceOf(address(eurVault)), assets, "vault holds fee + claimable on its balance");
+        // The claimable payout is still counted by realAssets via the settled position.
+        assertEq(adapter.realAssets(), expectedClaimable, "realAssets counts the position's claimable EURC");
     }
 
-    /* PERMISSIONLESS pullClaimableShares / pullClaimableEurc */
+    /* PERMISSIONLESS sweepSettled */
 
-    /// @notice The permissionless `pullClaimableShares()` pulls gate-blocked deposit shares out
-    ///         of the EUR vault onto the adapter as live bpEUR.
-    function testPullClaimableSharesPullsDepositAndClearsSettledBatch(uint256 assets) public {
+    /// @notice The permissionless `sweepSettled` claims gate-blocked deposit shares from a settled
+    ///         position and brings them home as live bpEUR on the adapter.
+    function testSweepSettledPullsClaimableSharesHome(uint256 assets) public {
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
 
-        // Seed bpEUR via the gate-blocked deposit path so shares park as claimableShares and the deposit
-        // batch settles + closes (leaving it listed in openBatchIds until the next clear).
+        // Seed bpEUR via the gate-blocked deposit path so shares park as claimableShares under the
+        // position, whose batch then settles + closes.
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
         _settleAdapterBatchToClaimable();
 
         uint256 expectedShares = assets * BPEUR_PER_EURC;
+        address position = adapter.positions(0);
 
-        // Pre-state: full deposit sits as claimable shares; the settled deposit batch is still listed.
-        assertEq(eurVault.claimableShares(address(adapter)), expectedShares, "claimable == full deposit (no fees)");
-        assertEq(eurVault.balanceOf(address(adapter)), 0, "no live bpEUR before pull");
-        assertEq(adapter.openBatchIdsLength(), 1, "settled batch still listed pre-pull");
+        // Pre-state: full deposit sits as claimable shares under the settled position.
+        assertEq(eurVault.claimableShares(position), expectedShares, "claimable == full deposit (no fees)");
+        assertEq(eurVault.balanceOf(address(adapter)), 0, "no live bpEUR before sweep");
+        assertEq(adapter.positionsLength(), 1, "settled position still listed pre-sweep");
 
         // Permissionless: anyone may call
         address anyone = makeAddr("anyone");
-        vm.expectEmit(false, false, false, true, address(adapter));
-        emit IByzantineEurVaultAdapter.PullClaimableShares(expectedShares);
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit IByzantineEurVaultAdapter.SweepPosition(position, expectedShares, 0);
         vm.prank(anyone);
-        adapter.pullClaimableShares();
+        adapter.sweepSettled(type(uint256).max);
 
-        assertEq(eurVault.balanceOf(address(adapter)), expectedShares, "shares pulled to adapter");
-        assertEq(eurVault.claimableShares(address(adapter)), 0, "claimable drained");
-        assertEq(adapter.openBatchIdsLength(), 0, "settled batch cleared as side-effect");
-        assertEq(adapter.realAssets(), assets, "realAssets reflects the pulled bpEUR position");
+        assertEq(eurVault.balanceOf(address(adapter)), expectedShares, "shares swept to adapter");
+        assertEq(eurVault.claimableShares(position), 0, "claimable drained");
+        assertEq(adapter.positionsLength(), 0, "settled position dropped");
+        assertEq(adapter.realAssets(), assets, "realAssets reflects the swept bpEUR position");
     }
 
-    /// @notice The permissionless `pullClaimableEurc()` pulls a gate-blocked withdraw payout out
-    ///         of the EUR vault onto the adapter as idle EURC.
-    function testPullClaimableEurcPullsPayoutAndClearsSettledBatch(uint256 assets) public {
+    /// @notice The permissionless `sweepSettled` claims a gate-blocked withdraw payout from a settled
+    ///         position and brings it home as idle EURC on the adapter.
+    function testSweepSettledPullsClaimableEurcHome(uint256 assets) public {
         assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
 
-        // Seed bpEUR, then withdraw on the gate-blocked path so the payout parks as claimableEurc and the
-        // withdraw batch settles + closes (leaving it listed in openBatchIds until the next clear).
+        // Seed bpEUR, then withdraw on the gate-blocked path so the payout parks as claimableEurc
+        // under the withdraw position, whose batch then settles + closes.
         vault.deposit(assets, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", assets);
-        _settleAdapterBatch();
+        _settleAndSweep();
         uint256 shares = eurVault.balanceOf(address(adapter));
         vm.prank(adapterCurator);
         adapter.requestWithdraw(shares);
         _settleAdapterBatchToClaimable();
 
-        // Pre-state: full payout sits as claimable (no fees); the settled withdraw batch is still listed.
-        assertEq(eurVault.claimableEurc(address(adapter)), assets, "claimable == full payout (no fees)");
-        assertEq(eurc.balanceOf(address(adapter)), 0, "no idle EURC before pull");
-        assertEq(adapter.openBatchIdsLength(), 1, "settled batch still listed pre-pull");
+        address position = adapter.positions(0);
+
+        // Pre-state: full payout sits as claimable (no fees) under the settled position.
+        assertEq(eurVault.claimableEurc(position), assets, "claimable == full payout (no fees)");
+        assertEq(eurc.balanceOf(address(adapter)), 0, "no idle EURC before sweep");
+        assertEq(adapter.positionsLength(), 1, "settled position still listed pre-sweep");
 
         // Permissionless: anyone may call
         address anyone = makeAddr("anyone");
-        vm.expectEmit(false, false, false, true, address(adapter));
-        emit IByzantineEurVaultAdapter.PullClaimableEurc(assets);
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit IByzantineEurVaultAdapter.SweepPosition(position, 0, assets);
         vm.prank(anyone);
-        adapter.pullClaimableEurc();
+        adapter.sweepSettled(type(uint256).max);
 
-        assertEq(eurc.balanceOf(address(adapter)), assets, "payout pulled to adapter idle");
-        assertEq(eurVault.claimableEurc(address(adapter)), 0, "claimable drained");
-        assertEq(adapter.openBatchIdsLength(), 0, "settled batch cleared as side-effect");
-        assertEq(adapter.realAssets(), assets, "realAssets reflects the pulled idle EURC");
+        assertEq(eurc.balanceOf(address(adapter)), assets, "payout swept to adapter idle");
+        assertEq(eurVault.claimableEurc(position), 0, "claimable drained");
+        assertEq(adapter.positionsLength(), 0, "settled position dropped");
+        assertEq(adapter.realAssets(), assets, "realAssets reflects the swept idle EURC");
     }
 }

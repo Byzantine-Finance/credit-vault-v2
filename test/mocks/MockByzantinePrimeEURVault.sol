@@ -165,19 +165,19 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         batchUserWithdraw[batchId][receiver] += shares;
     }
 
-    /// @dev Reads `_claimableShares[receiver]` and transfers the shares to `receiver`.
+    /// @dev Mirrors the real vault: claims `msg.sender`'s claimable shares and sends them to `receiver`.
     function claimDepositShares(address receiver) external override {
-        uint256 amount = _claimableShares[receiver];
+        uint256 amount = _claimableShares[msg.sender];
         require(amount > 0, "nothing claimable");
-        _claimableShares[receiver] = 0;
+        _claimableShares[msg.sender] = 0;
         _transfer(address(this), receiver, amount);
     }
 
-    /// @dev Same `owner == receiver` convention as `claimDepositShares`.
+    /// @dev Mirrors the real vault: claims `msg.sender`'s claimable EURC and sends it to `receiver`.
     function claimWithdraw(address receiver) external override {
-        uint256 amount = _claimableEurc[receiver];
+        uint256 amount = _claimableEurc[msg.sender];
         require(amount > 0, "nothing claimable");
-        _claimableEurc[receiver] = 0;
+        _claimableEurc[msg.sender] = 0;
         IERC20(asset).transfer(receiver, amount);
     }
 

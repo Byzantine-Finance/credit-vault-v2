@@ -8,14 +8,13 @@ import {MathLib} from "../../src/libraries/MathLib.sol";
 
 /// @notice Testing `ByzantineEurVaultAdapter.realAssets()`
 /// @dev    `realAssets` is the adapter's source of truth for the parent vault's `accrueInterest` loop.
-///         Conceptually it is the sum of four branches:
-///           (A) idle EURC on the adapter + EURC claimable on the EUR vault
-///           (B) `convertToAssets(bpEUR balance + claimableShares)` - the value of the bpEUR position
-///           (C) per-open-batch pending deposit EURC - summed over open EUR-vault batches not yet settled (corrected
-/// via the snapshot-delta during partial finalize) 
-///           (D) per-open-batch `convertToAssets(pending withdraw shares)` - summed over the same set (same correction)
+///         Conceptually it is the sum of three branches:
+///           (A) idle EURC on the adapter
+///           (B) `convertToAssets(bpEUR balance on the adapter)`
+///           (C) the value of every live position (`EurVaultPosition.value()`): real holdings
+///               (balances + claimables) once its batch closed, the stored pending amount before that.
 ///
-/// @dev ±1-wei tolerances: convertToAssets() floors (rounds down). 
+/// @dev ±1-wei tolerances: convertToAssets() floors (rounds down).
 ///      A value that is exact in real terms (e.g. SEED) is reconstructed from
 ///      two independently-floored share→EURC conversions — convertToAssets(a) + convertToAssets(b)
 ///      can be 1 wei below convertToAssets(a + b). Tolerance only bites when W is not a clean
@@ -34,7 +33,7 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
     uint256 internal constant ASSETS_250 = 250e6;
 
     /* ------------------------------------------------------------------ */
-    /*  Branch (A): idle EURC + claimable EURC                            */
+    /*  Branch (A): idle EURC                                             */
     /* ------------------------------------------------------------------ */
 
     /// @notice Fresh adapter, no state set up - realAssets must be zero.
@@ -51,91 +50,92 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         assertEq(adapter.realAssets(), amount, "idle EURC must be counted via branch (A)");
     }
 
-    /// @notice EURC parked in `claimableEurc[adapter]` after a gate-blocked withdraw settlement is
-    ///         counted by branch (A).
-    /// @dev    Full deposit -> settle -> requestWithdraw -> settle (gate-blocked) - the withdraw
-    ///         payout lands in claimableEurc instead of being transferred directly.
-    function testRealAssetsCountsClaimableEurc() public {
-        // 1) Deposit + allocate + settle (gate-open: shares end up on the adapter directly).
-        vault.deposit(ASSETS_100, address(this));
-        vm.prank(allocator);
-        vault.allocate(address(adapter), hex"", ASSETS_100);
-        _settleAdapterBatch();
-
-        // 2) Burn the shares via requestWithdraw + settle on the gate-blocked path so the EURC payout
-        //    sits as claimableEurc instead of being transferred to the adapter.
-        uint256 shares = IERC20(address(eurVault)).balanceOf(address(adapter));
-        vm.prank(adapterCurator);
-        adapter.requestWithdraw(shares);
-        _settleAdapterBatchToClaimable();
-
-        // Adapter holds nothing idle; the EURC is sitting as claimableEurc on the EUR vault.
-        assertEq(eurc.balanceOf(address(adapter)), 0, "no idle EURC expected");
-        assertEq(eurVault.claimableEurc(address(adapter)), ASSETS_100, "claimable EURC must equal deposit");
-        assertEq(adapter.realAssets(), ASSETS_100, "claimable EURC must be counted via branch (A)");
-    }
-
     /* ------------------------------------------------------------------ */
-    /*  Branch (B): bpEUR position (balance + claimable shares)           */
+    /*  Branch (B): bpEUR balance on the adapter                          */
     /* ------------------------------------------------------------------ */
 
-    /// @notice After a gate-open settlement, shares are minted directly to the adapter. realAssets must
+    /// @notice After a gate-open settlement and a sweep, shares sit on the adapter. realAssets must
     ///         count them via `convertToAssets(balanceOf)`.
     function testRealAssetsCountsBpEurBalance() public {
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
 
-        _settleAdapterBatch(); // gate-open: shares delivered directly to the adapter
+        _settleAndSweep(); // gate-open settlement + sweep: shares delivered to the adapter
 
         uint256 shares = IERC20(address(eurVault)).balanceOf(address(adapter));
-        assertGt(shares, 0, "shares should be on adapter (gate-open settlement)");
-        assertEq(eurVault.claimableShares(address(adapter)), 0, "no claimable shares expected");
+        assertGt(shares, 0, "shares should be on adapter after the sweep");
+        assertEq(adapter.positionsLength(), 0, "no live position left");
 
         assertEq(adapter.realAssets(), ASSETS_100, "live bpEUR position must be counted via branch (B)");
     }
 
-    /// @notice After a gate-blocked settlement, shares are parked in `claimableShares[adapter]` instead
-    ///         of being minted to the adapter. realAssets must include them via `claimableShares`.
-    function testRealAssetsCountsClaimableShares() public {
+    /* ------------------------------------------------------------------ */
+    /*  Branch (C): settled positions (balances + claimables)             */
+    /* ------------------------------------------------------------------ */
+
+    /// @notice After a gate-blocked settlement, shares are parked in `claimableShares[position]`.
+    ///         The settled (not yet swept) position must be valued via its claimable shares.
+    function testRealAssetsCountsPositionClaimableShares() public {
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
 
-        _settleAdapterBatchToClaimable(); // gate-blocked: shares parked as claimable on the EUR vault
+        _settleAdapterBatchToClaimable(); // gate-blocked: shares parked as claimable under the position
 
-        assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "no live shares (gate-blocked)");
-        assertGt(eurVault.claimableShares(address(adapter)), 0, "shares must sit as claimable");
-        assertEq(adapter.realAssets(), ASSETS_100, "claimable shares must be counted via branch (B)");
+        address position = adapter.positions(0);
+        assertEq(IERC20(address(eurVault)).balanceOf(position), 0, "no live shares (gate-blocked)");
+        assertGt(eurVault.claimableShares(position), 0, "shares must sit as claimable");
+        assertEq(adapter.realAssets(), ASSETS_100, "claimable shares counted via the settled position");
+    }
+
+    /// @notice EURC parked in `claimableEurc[position]` after a gate-blocked withdraw settlement is
+    ///         counted via the settled position.
+    function testRealAssetsCountsPositionClaimableEurc() public {
+        // 1) Deposit + allocate + settle + sweep (gate-open: shares end up on the adapter).
+        vault.deposit(ASSETS_100, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", ASSETS_100);
+        _settleAndSweep();
+
+        // 2) Burn the shares via requestWithdraw + settle on the gate-blocked path so the EURC payout
+        //    sits as claimableEurc under the position instead of being transferred.
+        uint256 shares = IERC20(address(eurVault)).balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+        _settleAdapterBatchToClaimable();
+
+        address position = adapter.positions(0);
+        assertEq(eurc.balanceOf(address(adapter)), 0, "no idle EURC expected");
+        assertEq(eurVault.claimableEurc(position), ASSETS_100, "claimable EURC must equal deposit");
+        assertEq(adapter.realAssets(), ASSETS_100, "claimable EURC counted via the settled position");
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Branch (C): per-batch pending deposit EURC (pre-DNT settlement)       */
+    /*  Branch (C): pending positions (stored amounts)                    */
     /* ------------------------------------------------------------------ */
 
     /// @notice After `vault.allocate` and BEFORE any DNT settlement, the EURC sits in the EUR vault but
-    ///         no shares have been minted yet. The whole value must be tracked via the pending-deposit
-    ///         branch (C).
+    ///         no shares have been minted yet. The whole value must be tracked via the position's
+    ///         pending amount.
     function testRealAssetsCountsPendingDepositBeforeSettlement() public {
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
 
-        // No DNT yet: adapter has no EURC, no shares, only the pending shadow.
+        // No DNT yet: adapter has no EURC, no shares; only the position's pending amount carries value.
         assertEq(eurc.balanceOf(address(adapter)), 0, "no idle EURC");
         assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "no shares yet");
-        assertEq(eurVault.claimableShares(address(adapter)), 0, "no claimable shares yet");
 
-        uint256 batchId = adapter.openBatchIds(0);
-        (uint128 pendingDep,,,, bool isOpen) = adapter.batchAccounting(batchId);
-        assertTrue(isOpen, "batch should be open");
-        assertEq(uint256(pendingDep), ASSETS_100, "pending deposit EURC should equal allocated amount");
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertEq(position.pendingEurc(), ASSETS_100, "pending deposit EURC should equal allocated amount");
+        assertFalse(position.settled(), "position should be pending");
 
-        assertEq(adapter.realAssets(), ASSETS_100, "pending deposit must be counted via branch (C)");
+        assertEq(adapter.realAssets(), ASSETS_100, "pending deposit must be counted via the position");
     }
 
-    /// @notice Multiple allocates in the same (still-idle) batch accumulate into one pending-deposit
-    ///         entry. realAssets must equal the sum.
+    /// @notice Multiple allocates in the same (still-idle) batch each get their own position.
+    ///         realAssets must equal the sum.
     function testRealAssetsAccumulatesMultiAllocateSameBatch() public {
         vault.deposit(ASSETS_100 + ASSETS_250, address(this));
 
@@ -144,28 +144,18 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         vault.allocate(address(adapter), hex"", ASSETS_250);
         vm.stopPrank();
 
-        // Only one batch opened (we never settled in between -> same currentBatchId).
-        assertEq(adapter.openBatchIdsLength(), 1, "exactly one open batch");
-        uint256 batchId = adapter.openBatchIds(0);
-        (uint128 pendingDep,,,,) = adapter.batchAccounting(batchId);
-        assertEq(uint256(pendingDep), ASSETS_100 + ASSETS_250, "pending must accumulate both allocates");
-
+        assertEq(adapter.positionsLength(), 2, "one position per allocate");
         assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "realAssets must equal sum of both allocates");
     }
 
-    /* ------------------------------------------------------------------ */
-    /*  Branch (D): per-batch pending withdraw shares (pre-DNT settlement)    */
-    /* ------------------------------------------------------------------ */
-
     /// @notice After `requestWithdraw` burns the adapter's bpEUR but BEFORE the next DNT settlement, the
-    ///         position is tracked in `pendingWithdrawShares`. realAssets must value it via
-    ///         `convertToAssets`.
+    ///         position is tracked via `pendingShares`. realAssets must value it via `convertToAssets`.
     function testRealAssetsCountsPendingWithdrawSharesBeforeSettlement() public {
         // Seed the adapter with bpEUR via a full deposit cycle on the gate-open path.
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         // Now burn the shares via requestWithdraw, but do NOT settle yet.
         uint256 shares = IERC20(address(eurVault)).balanceOf(address(adapter));
@@ -174,15 +164,12 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
 
         // Adapter no longer has live shares - they were burned at request time.
         assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "shares burned at request");
-        assertEq(eurVault.claimableEurc(address(adapter)), 0, "no claimable EURC yet");
 
-        // The position is now in the pending-withdraw shadow of the active batch.
-        uint256 batchId = adapter.openBatchIds(0);
-        (,, uint256 pendingW,,) = adapter.batchAccounting(batchId);
-        assertEq(pendingW, shares, "pendingWithdrawShares must equal burned shares");
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertEq(position.pendingShares(), shares, "pendingShares must equal burned shares");
 
         // realAssets must value the pending withdraw at the EUR vault's current PPS (= 1 at this point).
-        assertEq(adapter.realAssets(), ASSETS_100, "pending withdraw must be counted via branch (D)");
+        assertEq(adapter.realAssets(), ASSETS_100, "pending withdraw must be counted via the position");
     }
 
     /* ------------------------------------------------------------------ */
@@ -192,9 +179,6 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
     /// @notice With another depositor active in the EUR vault, the adapter's `realAssets` must reflect
     ///         only its OWN position — it must not absorb value contributed by other depositors via the
     ///         shared `totalEurcBacking`.
-    /// @dev    Validates that the EUR vault's PPS math (which depends on totalEurcBacking and totalSupply
-    ///         shared across all depositors) does not pollute the adapter's per-position accounting in
-    ///         `_realAssets`. Assume that `owner` == `receiver`.
     function testRealAssetsIsolatedFromOtherDepositors() public {
         address externalUser = makeAddr("externalUser");
         deal(address(eurc), externalUser, ASSETS_250);
@@ -205,15 +189,15 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
+        address position = adapter.positions(0);
 
-        // 2) External user deposits 250 EURC directly to the EUR vault, naming themselves as receiver
-        //    (per the owner == receiver convention).
+        // 2) External user deposits 250 EURC directly to the EUR vault, naming themselves as receiver.
         vm.prank(externalUser);
         eurVault.requestDeposit(ASSETS_250, externalUser);
 
         // Settle both tickets in one DNT cycle.
         address[] memory receivers = new address[](2);
-        receivers[0] = address(adapter);
+        receivers[0] = position;
         receivers[1] = externalUser;
         eurVault.executeDnt();
         eurVault.processDepositChunk(receivers, type(uint256).max);
@@ -223,7 +207,7 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         // Adapter's realAssets must equal its own deposit (100 EURC), NOT the total backing (350 EURC).
         assertEq(adapter.realAssets(), ASSETS_100, "adapter realAssets isolated from external depositor");
         // Sanity: each party holds the right share count post-settlement.
-        assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), ASSETS_100 * BPEUR_PER_EURC, "adapter shares");
+        assertEq(IERC20(address(eurVault)).balanceOf(position), ASSETS_100 * BPEUR_PER_EURC, "position shares");
         assertEq(IERC20(address(eurVault)).balanceOf(externalUser), ASSETS_250 * BPEUR_PER_EURC, "external user shares");
     }
 
@@ -253,12 +237,13 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         eurVault.requestDeposit(ASSETS_100, holder);
 
         address[] memory seeders = new address[](2);
-        seeders[0] = address(adapter);
+        seeders[0] = adapter.positions(0);
         seeders[1] = holder;
         eurVault.executeDnt();
         eurVault.processDepositChunk(seeders, type(uint256).max);
         eurVault.processWithdrawChunk(seeders, type(uint256).max);
         eurVault.closeBatch();
+        adapter.sweepSettled(type(uint256).max);
 
         assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), seedShares, "adapter seeded shares");
         assertEq(IERC20(address(eurVault)).balanceOf(holder), seedShares, "holder seeded shares");
@@ -280,15 +265,16 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         eurVault.requestWithdraw(seedShares, holder, holder);
 
         address[] memory parties = new address[](3);
-        parties[0] = address(adapter);
+        parties[0] = adapter.positions(0); // the adapter's withdraw position
         parties[1] = holder;
         parties[2] = entrant;
         eurVault.executeDnt();
         eurVault.processDepositChunk(parties, type(uint256).max);
         eurVault.processWithdrawChunk(parties, type(uint256).max);
         eurVault.closeBatch();
+        adapter.sweepSettled(type(uint256).max);
 
-        // Adapter exited fully at PPS 1.5: 150 EURC paid out, valued by branch (A) as idle EURC. The
+        // Adapter exited fully at PPS 1.5: 150 EURC paid out, swept home as idle EURC. The
         // concurrent entrant deposit and co-withdrawer exit do NOT leak into the adapter's accounting.
         uint256 adapterExitValue = ASSETS_100 + YIELD / 2; // 150 EURC
         assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "adapter fully exited (no shares)");
@@ -305,20 +291,20 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
     }
 
     /* ------------------------------------------------------------------- */
-    /*  Partial burn before DNT execution                       */
+    /*  Partial burn before DNT execution                                  */
     /* ------------------------------------------------------------------- */
 
     /// @notice After a *partial* `requestWithdraw` (NormalIdle, no DNT yet), the burned shares are
     ///         still economically outstanding until the next DNT settles them. The EUR vault must
     ///         preserve PPS across this gap, so `realAssets` must remain equal to the original
-    ///         deposit — half from the adapter's remaining bpEUR (branch B), half from the queued
-    ///         burn (branch D), both valued at the *pre-burn* share price.
+    ///         deposit — half from the adapter's remaining bpEUR, half from the position's queued
+    ///         burn, both valued at the *pre-burn* share price.
     function testRealAssetsStableAcrossPartialBurnBeforeDnt() public {
         // Seed 100 EURC of bpEUR onto the adapter via a full deposit cycle.
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
-        _settleAdapterBatch();
+        _settleAndSweep();
 
         uint256 totalShares = IERC20(address(eurVault)).balanceOf(address(adapter));
         uint256 halfShares = totalShares / 2;
@@ -332,9 +318,9 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         vm.prank(adapterCurator);
         adapter.requestWithdraw(halfShares);
 
-        // The adapter's bpEUR position is now split between (B) remaining live shares and (D) queued
-        // burn. Both halves are valued at the same pre-burn PPS, so the sum must equal the original
-        // deposit (within 1 wei for rounding).
+        // The adapter's bpEUR position is now split between its remaining live shares and the
+        // position's queued burn. Both halves are valued at the same pre-burn PPS, so the sum must
+        // equal the original deposit (within 1 wei for rounding).
         uint256 realAfter = adapter.realAssets();
         assertApproxEqAbs(realAfter, ASSETS_100, 1, "post-partial-burn realAssets must not inflate");
     }
@@ -343,22 +329,22 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
     /*  Edge case: tickets processed but batch not closed                 */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Test for the snapshot-delta double-counting fix.
-    /// @dev    Walk-through of the seven check-points, all asserting `realAssets ≈ SEED + D`:
+    /// @notice Core invariant behind the position-isolation design: between ticket processing and
+    ///         batch close, settled proceeds land on the POSITIONS (not the adapter), and pending
+    ///         positions keep being valued at their stored amounts. No double counting is possible
+    ///         because the two sources never overlap.
+    /// @dev    Walk-through of the check-points, all asserting `realAssets ≈ SEED + D`:
     ///           0) Seed via a full prior batch -> adapter holds `SEED` worth of bpEUR.
-    ///           1) `allocate(D)` opens batch N: snapshot captures `(seedShares, 0)`.
-    ///           2) `requestWithdraw(W)` burns W shares; sharesSnapshot decremented to
-    ///              `(seedShares − W, 0)`; pendingWithdrawShares = W.
+    ///           1) `allocate(D)` opens a deposit position on batch N.
+    ///           2) `requestWithdraw(W)` opens a withdraw position on batch N (burns W shares).
     ///           3) `executeDnt()` flips `DntInProgress`. No tickets processed yet.
-    ///           4) `processDepositChunk` settles the adapter's deposit ticket: bpEUR silently minted;
-    ///              `pendingDepositEurc` shadow STALE; sharesDelta correction cancels it.
-    ///           5) `processWithdrawChunk` settles the withdraw ticket: EURC silently paid to adapter;
-    ///              `pendingWithdrawShares` shadow STALE; eurcDelta correction cancels it.
-    ///           6) `closeBatch` advances `currentBatchId`; snapshot branch disarms (batchId < closedBelow).
-    ///
-    ///         A ±1-wei tolerance is used where `W` is not a clean multiple of `BPEUR_PER_EURC` (the
-    ///         EUR-vault's withdraw payout rounds down). The parent vault's `totalAssets()` is
-    ///         reconciled at the end via `accrueInterest()`.
+    ///           4) `processDepositChunk` settles the deposit ticket: bpEUR minted to the DEPOSIT
+    ///              POSITION; the position is still valued at `pendingEurc` (close-based), and the
+    ///              minted shares are NOT counted (they sit on the position, not the adapter).
+    ///           5) `processWithdrawChunk` settles the withdraw ticket: EURC paid to the WITHDRAW
+    ///              POSITION; same isolation argument.
+    ///           6) `closeBatch` — both positions flip to settled and are valued by their real
+    ///              holdings; a sweep brings everything home.
     function testRealAssetsStableAcrossPartialFinalize(uint256 depositAmount, uint256 withdrawShares) public {
         uint256 SEED = 100e6; // 100 EURC seed in batch 0 — gives the adapter bpEUR to burn for the withdraw
         depositAmount = bound(depositAmount, 1e6, SEED); // [1, 100] EURC for batch N's deposit
@@ -372,90 +358,60 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         vault.deposit(SEED, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", SEED);
-        _settleAdapterBatch(); // gate-open: shares minted directly to the adapter
+        _settleAndSweep(); // gate-open: shares minted to the position, then swept to the adapter
         assertEq(adapter.realAssets(), SEED, "phase 0: post-seed realAssets == SEED");
         assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), seedShares, "phase 0: adapter holds seedShares");
 
-        // ---- Phase 1: allocate(D) opens batch N; the snapshot captures the adapter's pre-batch state ----
+        // ---- Phase 1: allocate(D) opens a deposit position on batch N ----
         vault.deposit(depositAmount, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", depositAmount);
-
-        uint256 batchN = adapter.openBatchIds(0);
-        {
-            (uint128 pd, int128 eurcSnap, uint256 pw, int256 sharesSnap, bool isOpen) = adapter.batchAccounting(batchN);
-            assertTrue(isOpen, "phase 1: batch open");
-            assertEq(uint256(pd), depositAmount, "phase 1: pendingDeposit = D");
-            assertEq(pw, 0, "phase 1: no pendingWithdraw yet");
-            assertEq(sharesSnap, int256(seedShares), "phase 1: sharesSnapshotAtBatch = seedShares");
-            assertEq(eurcSnap, int128(0), "phase 1: eurcSnapshotAtBatch = 0");
-        }
+        address depositPosition = adapter.positions(0);
         assertEq(adapter.realAssets(), expected, "phase 1: realAssets = SEED + D");
 
-        // ---- Phase 2: requestWithdraw(W) burns W shares; sharesSnapshot decremented by W ----
+        // ---- Phase 2: requestWithdraw(W) opens a withdraw position on batch N ----
         vm.prank(adapterCurator);
         adapter.requestWithdraw(withdrawShares);
-        {
-            (uint128 pd,, uint256 pw, int256 sharesSnap,) = adapter.batchAccounting(batchN);
-            assertEq(uint256(pd), depositAmount, "phase 2: pendingDeposit unchanged");
-            assertEq(pw, withdrawShares, "phase 2: pendingWithdraw = W");
-            assertEq(sharesSnap, int256(seedShares - withdrawShares), "phase 2: sharesSnapshot decremented by W");
-        }
-        // Value preserved: shares were burned out of (B), but their value moved to (D) at the same PPS.
-        // ±1-wei tolerance for integer-division rounding when W is not a clean multiple of BPEUR_PER_EURC:
-        // `convertToAssets((seedShares-W)) + convertToAssets(W)` can round down by 1 vs `convertToAssets(seedShares) =
-        // SEED`.
+        address withdrawPosition = adapter.positions(1);
+        // Value preserved: shares were burned out of the adapter, but their value moved to the
+        // position at the same PPS. ±1-wei tolerance for integer-division rounding when W is not a
+        // clean multiple of BPEUR_PER_EURC.
         assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 2: realAssets preserved post-requestWithdraw");
 
         // ---- Phase 3: executeDnt — `DntInProgress` flips on. No tickets processed yet ----
         eurVault.executeDnt();
         assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 3: realAssets preserved post-executeDnt");
 
-        // ---- Phase 4: keeper settles the deposit chunk silently (bpEUR minted to adapter) ----
-        // First half of the partial-finalize window: only the deposit ticket has been processed
-        // (adapter received its bpEUR) but the batch is NOT closed yet.
-        address[] memory receivers = new address[](1);
-        receivers[0] = address(adapter);
+        // ---- Phase 4: keeper settles the deposit chunk silently (bpEUR minted to the position) ----
+        address[] memory receivers = new address[](2);
+        receivers[0] = depositPosition;
+        receivers[1] = withdrawPosition;
         eurVault.processDepositChunk(receivers, type(uint256).max);
 
-        // bpEUR balance grew by `D` worth — but the adapter's shadow is intentionally STALE.
+        // The position received its bpEUR, but it is still valued at `pendingEurc` (close-based) and
+        // the minted shares are NOT double counted (they are on the position, not the adapter).
         assertEq(
-            IERC20(address(eurVault)).balanceOf(address(adapter)),
-            seedShares - withdrawShares + depositAmount * BPEUR_PER_EURC,
-            "phase 4: shares grew by D worth (deposit ticket silently processed)"
+            IERC20(address(eurVault)).balanceOf(depositPosition),
+            depositAmount * BPEUR_PER_EURC,
+            "phase 4: deposit ticket silently processed onto the position"
         );
-        {
-            (uint128 pd,, uint256 pw,,) = adapter.batchAccounting(batchN);
-            assertEq(uint256(pd), depositAmount, "phase 4: pendingDeposit shadow STALE (proves correction needed)");
-            assertEq(pw, withdrawShares, "phase 4: pendingWithdraw shadow unchanged");
-        }
-        // The snapshot-delta correction cancels the stale (C) entirely.
-        assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 4: snapshot-delta cancels stale deposit shadow");
+        assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 4: no double counting mid-finalize");
 
-        // ---- Phase 5: keeper settles the withdraw chunk silently (EURC paid to adapter) ----
-        // Second half of the partial-finalize window. Both tickets are now processed but the batch is
-        // STILL not closed.
+        // ---- Phase 5: keeper settles the withdraw chunk silently (EURC paid to the position) ----
         eurVault.processWithdrawChunk(receivers, type(uint256).max);
 
         // EURC paid = withdraw shares valued at seed PPS (W * SEED / seedShares).
         uint256 expectedEurcPaid = withdrawShares.mulDivDown(SEED, seedShares);
-        assertEq(eurc.balanceOf(address(adapter)), expectedEurcPaid, "phase 5: EURC paid to adapter");
-        {
-            (uint128 pd,, uint256 pw,,) = adapter.batchAccounting(batchN);
-            assertEq(uint256(pd), depositAmount, "phase 5: pendingDeposit shadow still STALE");
-            assertEq(pw, withdrawShares, "phase 5: pendingWithdraw shadow still STALE");
-        }
+        assertEq(eurc.balanceOf(withdrawPosition), expectedEurcPaid, "phase 5: EURC paid to the position");
+        assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 5: no double counting either side");
 
-        // Deposit + withdraw snapshot-deltas offset stale (C)/(D); ±1 wei if W doesn’t divide BPEUR_PER_EURC
-        // cleanly.
-        assertApproxEqAbs(
-            adapter.realAssets(), expected, 1, "phase 5: both deltas cancel both stale shadows (within 1 wei)"
-        );
-
-        // ---- Phase 6: closeBatch — currentBatchId advances; snapshot branch disarms ----
-        // Value carried by branches (A) (EURC paid out) and (B) (live bpEUR balance) alone.
+        // ---- Phase 6: closeBatch — both positions settle; the sweep brings everything home ----
         eurVault.closeBatch();
-        assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 6: post-close, snapshot disarmed, batch skipped");
+        assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 6: post-close, settled positions valued real");
+
+        adapter.sweepSettled(type(uint256).max);
+        assertEq(adapter.positionsLength(), 0, "phase 6: positions swept");
+        assertApproxEqAbs(adapter.realAssets(), expected, 1, "phase 6: post-sweep value preserved");
 
         // ---- Final: parent vault's totalAssets() coherent with the adapter's realAssets ----
         vault.accrueInterest();
@@ -463,159 +419,135 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Edge cases: negative snapshots (deficit invariants)                */
+    /*  Audit-finding regression: stale valuation of a batch opened       */
+    /*  during the previous batch's DNT                                   */
     /* ------------------------------------------------------------------ */
 
-    /// @notice `sharesSnapshotAtBatch` legitimately goes NEGATIVE when burns exceed the snapshot
-    ///         captured at batch open. `realAssets()` must remain correct.
-    function testSharesSnapshotGoesNegativeWhenBurnExceedsBatchOpenBalance(uint256 depositAmount, uint256 burnShares)
-        public
-    {
-        depositAmount = bound(depositAmount, 1e6, 100e6); // [1, 100] EURC
-        uint256 mintedShares = depositAmount * BPEUR_PER_EURC;
-        // Burn must be > 0 and ≤ what was minted.
-        burnShares = bound(burnShares, 1, mintedShares);
-
-        // ---- Phase 0: open batch N via `allocate(D)` — adapter starts with ZERO bpEUR ----
-        vault.deposit(depositAmount, address(this));
+    /// @notice Regression for the audited stale-snapshot understatement (deposit side).
+    ///         A request made DURING batch N's DNT queues on batch N+1. Batch N then settles and
+    ///         closes WITHOUT any adapter call, and batch N+1 enters its own DNT. The audited
+    ///         snapshot-delta design misattributed batch N's settlement to batch N+1 and zeroed its
+    ///         pending value (reported 150 instead of 200 in the finding's walk-through). With
+    ///         per-position isolation no re-anchor is needed: realAssets must stay exact.
+    function testRealAssetsNoUnderstatementForBatchOpenedDuringPriorDnt() public {
+        // Batch N: allocate A1, then enter DNT.
+        vault.deposit(ASSETS_100 + ASSETS_250, address(this));
         vm.prank(allocator);
-        vault.allocate(address(adapter), hex"", depositAmount);
-        uint256 batchN = adapter.openBatchIds(0);
-        {
-            (uint128 pd,,, int256 sharesSnap, bool isOpen) = adapter.batchAccounting(batchN);
-            assertTrue(isOpen, "phase 0: batch N open");
-            assertEq(uint256(pd), depositAmount, "phase 0: pendingDeposit = D");
-            assertEq(sharesSnap, int256(0), "phase 0: sharesSnapshot at open is 0 (empty adapter)");
-        }
-
-        // ---- Phase 1: executeDnt — no settlement yet ----
+        vault.allocate(address(adapter), hex"", ASSETS_100);
         eurVault.executeDnt();
-        assertEq(adapter.realAssets(), depositAmount, "phase 1: realAssets via pending deposit only");
 
-        // ---- Phase 2: deposit chunk processed silently — shares minted to adapter ----
-        address[] memory receivers = new address[](1);
-        receivers[0] = address(adapter);
-        eurVault.processDepositChunk(receivers, type(uint256).max);
-        assertEq(
-            IERC20(address(eurVault)).balanceOf(address(adapter)), mintedShares, "phase 2: shares minted to adapter"
-        );
+        // Mid-DNT: allocate A2 — queues on batch N+1 in its own position.
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", ASSETS_250);
 
-        // ---- Phase 3: requestWithdraw(burnShares) mid-DNT ----
-        vm.prank(adapterCurator);
-        adapter.requestWithdraw(burnShares);
+        // Settle + close batch N. NO adapter state-changing call afterwards.
+        address[] memory r = new address[](1);
+        r[0] = adapter.positions(0);
+        eurVault.processDepositChunk(r, type(uint256).max);
+        eurVault.processWithdrawChunk(r, type(uint256).max);
+        eurVault.closeBatch();
 
-        // ASSERTION: snapshot[N] is now NEGATIVE.
-        {
-            (,,, int256 sharesSnap,) = adapter.batchAccounting(batchN);
-            assertEq(sharesSnap, -int256(burnShares), "phase 3: sharesSnapshot[N] is NEGATIVE (= -burnShares)");
-        }
+        // Batch N+1 enters its own DNT — the audited design understated realAssets right here.
+        eurVault.executeDnt();
 
-        // Batch N+1 is opened with a fresh post-burn snapshot.
-        assertEq(adapter.openBatchIdsLength(), 2, "phase 3: batch N+1 also tracked");
-        uint256 batchNplus1 = adapter.openBatchIds(1);
-        {
-            (,, uint256 pwNext, int256 sharesSnapNext,) = adapter.batchAccounting(batchNplus1);
-            assertEq(pwNext, burnShares, "phase 3: pendingWithdraw on batch N+1 = burnShares");
-            assertEq(
-                sharesSnapNext, int256(mintedShares - burnShares), "phase 3: sharesSnapshot[N+1] = post-burn balance"
-            );
-        }
-
-        // ---- Phase 4: despite the NEGATIVE snapshot, realAssets must still equal D ----
-        // The negative snapshot is what makes sharesDelta recover the FULL mint:
-        //     (D * BPEUR_PER_EURC − Y) − (−Y) = D * BPEUR_PER_EURC
-        // → eurcDelta = D → pendingDepositEurc=D fully cancelled.
-        // ±1 wei tolerance for rounding.
-        assertApproxEqAbs(
-            adapter.realAssets(), depositAmount, 1, "phase 4: realAssets stays at D even with sharesSnapshot[N] < 0"
-        );
+        assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "no understatement mid-DNT of batch N+1");
     }
 
-    /// @notice `eurcSnapshotAtBatch` legitimately goes NEGATIVE when EURC transfers-out exceed the
-    ///         snapshot captured at batch open. Symmetric to the shares-side test.
-    function testEurcSnapshotGoesNegativeWhenTransferOutExceedsBatchOpenBalance(uint256 withdrawShares) public {
-        uint256 SEED = 100e6; // 100 EURC seed
+    /// @notice Same regression on the withdraw side: a withdraw requested during batch N's DNT
+    ///         queues on batch N+1; after N closes silently and N+1 enters DNT, the pending withdraw
+    ///         must still be fully valued.
+    function testRealAssetsNoUnderstatementForWithdrawOpenedDuringPriorDnt() public {
+        uint256 SEED = 200e6;
         uint256 seedShares = SEED * BPEUR_PER_EURC;
-        // ≥ 1 EURC worth so payout > 0; ≤ seedShares − 1 leaves ≥ 1 raw share on the adapter so the
-        // post-deallocate allocation stays strictly positive (VaultV2 invariant).
-        withdrawShares = bound(withdrawShares, BPEUR_PER_EURC, seedShares - 1);
-        uint256 expectedPayout = withdrawShares.mulDivDown(SEED, seedShares);
-        vm.assume(expectedPayout > 0);
+        uint256 w = seedShares / 4; // 50 EURC worth per withdraw
 
-        // ---- Phase 0: seed via a full prior batch (closes cleanly) ----
+        // Seed the adapter with bpEUR.
         vault.deposit(SEED, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", SEED);
-        _settleAdapterBatch();
-        assertEq(adapter.realAssets(), SEED, "phase 0: post-seed");
+        _settleAndSweep();
 
-        // ---- Phase 1: requestWithdraw(W) opens batch N with eurcSnapshot = 0 ----
+        // Batch N: first withdraw, then enter DNT.
         vm.prank(adapterCurator);
-        adapter.requestWithdraw(withdrawShares);
-        uint256 batchN = adapter.openBatchIds(0);
-        {
-            (uint128 pd, int128 eurcSnap, uint256 pw, int256 sharesSnap, bool isOpen) = adapter.batchAccounting(batchN);
-            assertTrue(isOpen, "phase 1: batch N open");
-            assertEq(uint256(pd), 0, "phase 1: no deposit on this batch");
-            assertEq(pw, withdrawShares, "phase 1: pendingWithdraw = W");
-            assertEq(sharesSnap, int256(seedShares - withdrawShares), "phase 1: sharesSnapshot = seedShares - W");
-            assertEq(eurcSnap, int128(0), "phase 1: eurcSnapshot at open = 0 (empty EURC balance)");
-        }
-
-        // ---- Phase 2: executeDnt ----
+        adapter.requestWithdraw(w);
+        address position1 = adapter.positions(0);
         eurVault.executeDnt();
 
-        // ---- Phase 3: withdraw chunk processed silently — EURC paid to adapter ----
-        address[] memory receivers = new address[](1);
-        receivers[0] = address(adapter);
-        eurVault.processWithdrawChunk(receivers, type(uint256).max);
-        assertEq(eurc.balanceOf(address(adapter)), expectedPayout, "phase 3: EURC paid to adapter");
-        // realAssets is still SEED at this point — the eurcDelta correction cancels the stale shadow.
-        assertApproxEqAbs(adapter.realAssets(), SEED, 1, "phase 3: realAssets stays SEED");
+        // Mid-DNT: second withdraw — queues on batch N+1 in its own position.
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(w);
 
-        // ---- Phase 4: vault.deallocate(payout) — eurcSnapshot decremented past zero ----
+        // Settle + close batch N (pays position1). NO adapter call afterwards.
+        address[] memory r = new address[](1);
+        r[0] = position1;
+        eurVault.processDepositChunk(r, type(uint256).max);
+        eurVault.processWithdrawChunk(r, type(uint256).max);
+        eurVault.closeBatch();
 
+        // Batch N+1 enters its own DNT — the audited design wrongly zeroed position2's pending here.
+        eurVault.executeDnt();
+
+        assertApproxEqAbs(adapter.realAssets(), SEED, 1, "no understatement mid-DNT of batch N+1 (withdraw side)");
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Donation resistance                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// @notice Donating bpEUR or EURC to a PENDING position must not change its valuation: the
+    ///         pending branch of `value()` reads no balances, so a 1-wei donation cannot flip the
+    ///         position into being valued by its (near-zero) real holdings.
+    function testRealAssetsDonationToPendingPositionIsIgnored() public {
+        vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
-        vault.deallocate(address(adapter), hex"", expectedPayout);
+        vault.allocate(address(adapter), hex"", ASSETS_100);
+        address position = adapter.positions(0);
 
-        // ASSERTION: eurcSnapshot[N] is now NEGATIVE.
-        {
-            (, int128 eurcSnap,,,) = adapter.batchAccounting(batchN);
-            assertEq(eurcSnap, -int128(int256(expectedPayout)), "phase 4: eurcSnapshot[N] is NEGATIVE (= -payout)");
-        }
-        assertEq(eurc.balanceOf(address(adapter)), 0, "phase 4: EURC transferred out");
+        // Donate 1 wei of bpEUR and 1 wei of EURC to the pending position.
+        deal(address(eurVault), position, 1);
+        deal(address(eurc), position, 1);
 
-        // ---- Phase 5: despite the NEGATIVE snapshot, realAssets is correct ----
-        // The negative snapshot is what makes eurcDelta recover the FULL payout:
-        //     0 − (−payout) = payout
-        // → pendingWithdrawShares=W (worth `payout`) fully cancelled.
-        assertApproxEqAbs(
-            adapter.realAssets(),
-            SEED - expectedPayout,
-            1,
-            "phase 5: realAssets = SEED - payout even with eurcSnapshot[N] < 0"
-        );
+        assertEq(adapter.realAssets(), ASSETS_100, "donations cannot flip a pending position's valuation");
+    }
+
+    /// @notice Donations to a SETTLED position are simply extra value (counted, then swept home):
+    ///         the error direction is upward only, which the parent vault's maxRate cap smooths.
+    function testRealAssetsDonationToSettledPositionOnlyAddsValue() public {
+        vault.deposit(ASSETS_100, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", ASSETS_100);
+        _settleAdapterBatch();
+        address position = adapter.positions(0);
+
+        uint256 donation = 5e6;
+        deal(address(eurc), position, donation);
+
+        assertEq(adapter.realAssets(), ASSETS_100 + donation, "settled donation adds value (upward only)");
+
+        adapter.sweepSettled(type(uint256).max);
+        assertEq(eurc.balanceOf(address(adapter)), donation, "donation swept home with the proceeds");
+        assertEq(adapter.realAssets(), ASSETS_100 + donation, "value preserved after the sweep");
     }
 
     /* ------------------------------------------------------------------ */
     /*  Swap-fee residue during partial finalize (m=1 only)               */
     /* ------------------------------------------------------------------ */
     //
-    // The `_realAssets` NatSpec documents a known transient over-state during the active settlement
-    // window of a batch with a non-zero hedge swap fee. The documented upper bound is:
+    // The `EurVaultPosition.value()` NatSpec documents a known transient over-statement during the
+    // active settlement window of a batch with a non-zero hedge swap fee. The documented upper bound:
     //
-    //  residue_max = (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) ×
-    //                 batchAccounting[currentBatchId].pendingDepositEurc
+    //  residue_max = (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) × pendingEurc
 
     /// @notice Deposit-side swap-fee residue: between `processDepositChunk` and `closeBatch`,
-    ///         `realAssets()` reports the PRE-haircut deposit amount even though the on-chain swap
+    ///         `realAssets()` reports the PRE-haircut pending amount even though the on-chain swap
     ///         loss has already been realized into the EUR vault's reserve. `closeBatch` resolves it.
     /// @dev    Walk-through (D = depositAmount, x = swapFeeBps / 10_000):
-    ///           0) `allocate(D)` opens the batch with a pending deposit of D.
+    ///           0) `allocate(D)` opens a position with a pending deposit of D.
     ///           1) `executeDnt` starts settlement.
-    ///           2) `processDepositChunk` applies the haircut: adapter ends up with `effective = D * (1 - x)`.
+    ///           2) `processDepositChunk` applies the haircut: the position receives `effective = D * (1 - x)`
+    ///              worth of bpEUR, but is still valued at its stored pending amount (close-based).
     ///           3) Before close, `realAssets()` over-states by the residue `D - effective`.
-    ///           4) `closeBatch` drops the batch from accounting: `realAssets()` becomes exact (= effective).
+    ///           4) `closeBatch` flips the position to settled: `realAssets()` becomes exact (= effective).
     function testSwapFeeResidueOnDepositChunkVanishesAtClose(uint256 depositAmount, uint16 swapFeeBps) public {
         swapFeeBps = uint16(bound(uint256(swapFeeBps), 1, 1_000)); // [1bps, 10%], matches existing test bounds
         // Deposit amount, short for "D"
@@ -631,10 +563,11 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         // Floor of the formula
         uint256 formulaResidueFloor = depositAmount.mulDivDown(swapFeeBps, 10_000);
 
-        // ---- Phase 0: allocate(D) opens batch N — adapter starts EMPTY ----
+        // ---- Phase 0: allocate(D) opens a position — adapter starts EMPTY ----
         vault.deposit(depositAmount, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", depositAmount);
+        address position = adapter.positions(0);
         // Pre-DNT: realAssets counts the pending deposit at face value (fee not yet applied).
         assertEq(adapter.realAssets(), depositAmount, "phase 0: pre-DNT realAssets = D (full pending)");
 
@@ -642,14 +575,14 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         eurVault.executeDnt();
         assertEq(adapter.realAssets(), depositAmount, "phase 1: realAssets unchanged at DNT entry");
 
-        // ---- Phase 2: silent deposit chunk — adapter receives `effective × BPEUR_PER_EURC` bpEUR ----
+        // ---- Phase 2: silent deposit chunk — the position receives `effective × BPEUR_PER_EURC` bpEUR ----
         address[] memory receivers = new address[](1);
-        receivers[0] = address(adapter);
+        receivers[0] = position;
         eurVault.processDepositChunk(receivers, type(uint256).max);
-        // Adapter's bpEUR position only carries the post-haircut value; the swap-loss EURC sits on the
+        // The position's bpEUR only carries the post-haircut value; the swap-loss EURC sits on the
         // EUR vault contract balance.
         assertEq(
-            IERC20(address(eurVault)).balanceOf(address(adapter)),
+            IERC20(address(eurVault)).balanceOf(position),
             expectedEffective * BPEUR_PER_EURC,
             "phase 2: bpEUR balance = effective * scale (haircut applied)"
         );
@@ -657,8 +590,8 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         // ---- Phase 3: load-bearing checks on the mid-DNT residue ----
         uint256 realAssetsMidDnt = adapter.realAssets();
 
-        // (a) realAssets STILL reports the pre-haircut value — the snapshot-delta cancels only the
-        //     post-haircut share value out of `pendingDepositEurc=D`, leaving exactly `D − effective`.
+        // (a) realAssets STILL reports the pre-haircut value — the position is valued at its stored
+        //     pending amount until its batch closes (close-based valuation).
         assertEq(realAssetsMidDnt, depositAmount, "phase 3: realAssets over-states (= pre-haircut D)");
 
         // (b) The over-state is positive
@@ -684,11 +617,11 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
             "phase 3: residue >= floor(residue_max) - formula lower bound holds"
         );
 
-        // ---- Phase 4: closeBatch — batch N drops below closedBelow, residue VANISHES ----
+        // ---- Phase 4: closeBatch — the position settles, residue VANISHES ----
         eurVault.closeBatch();
         uint256 realAssetsPostClose = adapter.realAssets();
 
-        // Now realAssets reports the adapter's true holdings: only the post-haircut bpEUR position.
+        // Now realAssets reports the position's true holdings: only the post-haircut bpEUR.
         assertEq(
             realAssetsPostClose, expectedEffective, "phase 4: post-close realAssets = effective (exact, no residue)"
         );
