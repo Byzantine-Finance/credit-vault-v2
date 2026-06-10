@@ -5,113 +5,94 @@ pragma solidity ^0.8.0;
 
 import "./ByzantineEurVaultIntegrationTest.sol";
 
+/// @notice Position lifecycle across batches: sweep selectivity, gas-bounding and access.
 contract ByzantineEurVaultIntegrationBatchTest is ByzantineEurVaultIntegrationTest {
     uint256 internal constant ASSETS_100 = 100e6;
     uint256 internal constant ASSETS_250 = 250e6;
 
-    /// @notice anyCleared && remaining != 0: a settled batch is cleared while a second batch stays open,
-    ///         so the survivor's snapshots are re-anchored to the adapter's current balances.
-    /// @dev    Setup builds `openBatchIds = [batch1 (settled), batch2 (still open)]`:
-    ///           - allocate A1 opens batch1, then `executeDnt` locks it;
-    ///           - allocate A2 mid-DNT opens batch2 on `nextBatchId`;
-    ///           - settling + closing batch1 mints A1's bpEUR to the adapter and advances `currentBatchId`.
-    ///         A permissionless `pullClaimableShares()` then triggers `_clearSettledBatches`, which drops
-    ///         batch1 and re-anchors batch2's snapshots from `(0, 0)` (its at-open value, captured before
-    ///         A1 settled) to `(A1 worth of bpEUR, 0)`.
-    function testClearSettledBatchesReanchorsRemainingBatchSnapshots() public {
+    /// @notice A settled position is swept while a position queued on a later batch stays live.
+    /// @dev    Setup builds two positions: batch1 (settled) and batch2 (opened mid-DNT on `nextBatchId`).
+    ///         Settling + closing batch1 mints A1's bpEUR to position1; `sweepSettled` must bring it
+    ///         home and drop position1 while leaving position2 untouched.
+    function testSweepSettledRemovesOnlySettledPositions() public {
         // batch1: allocate A1, then start the DNT so it becomes the locked, in-settlement batch.
         vault.deposit(ASSETS_100 + ASSETS_250, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
         eurVault.executeDnt();
 
-        // batch2: allocate A2 mid-DNT — the adapter queues it on `nextBatchId`.
+        // batch2: allocate A2 mid-DNT — the position queues on `nextBatchId`.
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_250);
-        uint256 batch2 = adapter.openBatchIds(1);
-        assertEq(adapter.openBatchIdsLength(), 2, "two open batches before clearing");
+        assertEq(adapter.positionsLength(), 2, "two live positions before settling");
+        address position1 = adapter.positions(0);
+        address position2 = adapter.positions(1);
 
-        // batch2's snapshot is captured at open, BEFORE batch1 settles -> adapter held nothing then.
-        {
-            (, int128 eurcSnap,, int256 sharesSnap,) = adapter.batchAccounting(batch2);
-            assertEq(sharesSnap, int256(0), "batch2 shares snapshot at open == 0");
-            assertEq(eurcSnap, int128(0), "batch2 eurc snapshot at open == 0");
-        }
-
-        // Settle + close batch1: A1's bpEUR is minted to the adapter and `currentBatchId` advances past it.
+        // Settle + close batch1: A1's bpEUR is minted to position1 and `currentBatchId` advances past it.
         address[] memory r = new address[](1);
-        r[0] = address(adapter);
+        r[0] = position1;
         eurVault.processDepositChunk(r, type(uint256).max);
         eurVault.processWithdrawChunk(r, type(uint256).max);
         eurVault.closeBatch();
-        assertEq(eurVault.balanceOf(address(adapter)), ASSETS_100 * BPEUR_PER_EURC, "A1 bpEUR now on adapter");
+        assertEq(eurVault.balanceOf(position1), ASSETS_100 * BPEUR_PER_EURC, "A1 bpEUR now on position1");
+        assertTrue(EurVaultPosition(position1).settled(), "position1 settled");
+        assertFalse(EurVaultPosition(position2).settled(), "position2 still pending");
 
-        // Trigger `_clearSettledBatches` (permissionless). batch1 is dropped; batch2 survives and re-anchors.
-        adapter.pullClaimableShares();
+        // Permissionless sweep: position1 swept home, position2 survives.
+        adapter.sweepSettled(type(uint256).max);
 
-        // batch1 popped, batch2 is the sole survivor.
-        assertEq(adapter.openBatchIdsLength(), 1, "settled batch1 cleared");
-        assertEq(adapter.openBatchIds(0), batch2, "batch2 survives");
+        assertEq(adapter.positionsLength(), 1, "settled position1 dropped");
+        assertEq(adapter.positions(0), position2, "position2 survives");
+        assertEq(eurVault.balanceOf(address(adapter)), ASSETS_100 * BPEUR_PER_EURC, "A1 bpEUR swept to adapter");
+        assertEq(eurVault.balanceOf(position1), 0, "position1 emptied");
 
-        // batch2's snapshots re-anchored to the post-clear baseline; non-snapshot fields untouched.
-        (uint128 pendingDep, int128 eurcSnapAfter, uint256 pendingWith, int256 sharesSnapAfter, bool isOpen) =
-            adapter.batchAccounting(batch2);
-        assertEq(sharesSnapAfter, int256(ASSETS_100 * BPEUR_PER_EURC), "shares snapshot re-anchored to current bpEUR");
-        assertEq(eurcSnapAfter, int128(0), "eurc snapshot re-anchored to current idle EURC (0)");
-        assertEq(uint256(pendingDep), ASSETS_250, "pending deposit untouched by re-anchor");
-        assertEq(pendingWith, 0, "pending withdraw untouched by re-anchor");
-        assertTrue(isOpen, "batch2 still open");
-
-        // Sanity: value is coherent — A1 settled into bpEUR (branch B) + A2 still pending (branch C).
-        assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "realAssets coherent after re-anchor");
+        // Sanity: value is coherent — A1 settled into bpEUR on the adapter + A2 still pending.
+        assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "realAssets coherent after sweep");
     }
 
-    /// @notice anyCleared && remaining == 0: the only open batch settles, so clearing empties `openBatchIds`
-    ///         and the re-anchor loop is skipped (no survivor to re-anchor).
-    function testClearSettledBatchesSkipsReanchorWhenNoBatchRemains() public {
+    /// @notice Sweeping when every position is settled empties the tracking array.
+    function testSweepSettledEmptiesPositionsWhenAllSettled() public {
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
-        _settleAdapterBatch(); // settles + closes batch1; adapter still lists it in openBatchIds
-        assertEq(adapter.openBatchIdsLength(), 1, "batch1 still listed pre-clear");
+        _settleAdapterBatch(); // settles + closes batch1; the position is still listed
+        assertEq(adapter.positionsLength(), 1, "position still listed pre-sweep");
 
-        uint256 batch1 = adapter.openBatchIds(0);
+        adapter.sweepSettled(type(uint256).max);
 
-        // Clearing drops batch1; nothing remains, so the `remaining != 0` guard short-circuits the re-anchor.
-        adapter.pullClaimableShares();
-
-        assertEq(adapter.openBatchIdsLength(), 0, "openBatchIds emptied");
-        // The cleared batch's storage is fully zeroed by the `delete`.
-        (uint128 pendingDep, int128 eurcSnap, uint256 pendingWith, int256 sharesSnap, bool isOpen) =
-            adapter.batchAccounting(batch1);
-        assertEq(uint256(pendingDep), 0, "cleared batch pendingDeposit zeroed");
-        assertEq(eurcSnap, int128(0), "cleared batch eurc snapshot zeroed");
-        assertEq(pendingWith, 0, "cleared batch pendingWithdraw zeroed");
-        assertEq(sharesSnap, int256(0), "cleared batch shares snapshot zeroed");
-        assertFalse(isOpen, "cleared batch no longer open");
+        assertEq(adapter.positionsLength(), 0, "positions emptied");
+        assertEq(adapter.realAssets(), ASSETS_100, "value carried by the adapter's own balances");
     }
 
-    /// @notice !anyCleared: when no batch is settled, clearing is a no-op and the open batch's snapshots are
-    ///         left exactly as captured at open — the re-anchor must NOT run.
-    /// @dev    Idle EURC is dealt onto the adapter AFTER the batch opened so that, if the re-anchor wrongly
-    ///         fired, the eurc snapshot would jump from 0 to that idle amount. Asserting it stays 0 proves
-    ///         the `anyCleared` guard held.
-    function testClearSettledBatchesSkipsReanchorWhenNothingCleared() public {
+    /// @notice When no position is settled, sweeping is a no-op.
+    function testSweepSettledNoOpWhenNothingSettled() public {
         vault.deposit(ASSETS_100, address(this));
         vm.prank(allocator);
-        vault.allocate(address(adapter), hex"", ASSETS_100); // opens batch1, snapshot captured as (0, 0)
-        uint256 batch1 = adapter.openBatchIds(0);
+        vault.allocate(address(adapter), hex"", ASSETS_100); // queues on batch1, not settled
 
-        // Make the current balance diverge from the at-open snapshot.
-        deal(address(eurc), address(adapter), 50e6);
+        adapter.sweepSettled(type(uint256).max);
 
-        // No batch has settled (currentBatchId unchanged), so clearing finds nothing to drop.
-        adapter.pullClaimableShares();
+        assertEq(adapter.positionsLength(), 1, "pending position untouched");
+        assertEq(adapter.realAssets(), ASSETS_100, "realAssets unchanged");
+    }
 
-        assertEq(adapter.openBatchIdsLength(), 1, "batch1 still open (nothing cleared)");
-        (, int128 eurcSnap,, int256 sharesSnap, bool isOpen) = adapter.batchAccounting(batch1);
-        assertEq(sharesSnap, int256(0), "shares snapshot unchanged (no re-anchor)");
-        assertEq(eurcSnap, int128(0), "eurc snapshot unchanged despite 50 EURC idle (no re-anchor)");
-        assertTrue(isOpen, "batch1 still open");
+    /// @notice `maxPositions` bounds the sweep so it cannot run out of gas; remaining settled
+    ///         positions are swept by subsequent calls.
+    function testSweepSettledBoundedByMaxPositions() public {
+        vault.deposit(ASSETS_100 + ASSETS_250, address(this));
+        vm.startPrank(allocator);
+        vault.allocate(address(adapter), hex"", ASSETS_100);
+        vault.allocate(address(adapter), hex"", ASSETS_250);
+        vm.stopPrank();
+        _settleAdapterBatch(); // both positions settle in the same batch
+        assertEq(adapter.positionsLength(), 2, "two settled positions listed");
+
+        adapter.sweepSettled(1);
+        assertEq(adapter.positionsLength(), 1, "only one position swept (bounded)");
+
+        adapter.sweepSettled(1);
+        assertEq(adapter.positionsLength(), 0, "second call sweeps the rest");
+
+        assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "value preserved across bounded sweeps");
     }
 }

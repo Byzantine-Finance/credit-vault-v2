@@ -10,6 +10,7 @@ import "../../src/libraries/ConstantsLib.sol";
 
 import {ByzantineEurVaultAdapter} from "../../src/adapters/ByzantineEurVaultAdapter.sol";
 import {ByzantineEurVaultAdapterFactory} from "../../src/adapters/ByzantineEurVaultAdapterFactory.sol";
+import {EurVaultPosition} from "../../src/adapters/EurVaultPosition.sol";
 import {IByzantineEurVaultAdapter} from "../../src/adapters/interfaces/IByzantineEurVaultAdapter.sol";
 import {IByzantineEurVaultAdapterFactory} from "../../src/adapters/interfaces/IByzantineEurVaultAdapterFactory.sol";
 import {IByzantinePrimeEURVault} from "../../src/interfaces/IByzantinePrimeEURVault.sol";
@@ -111,12 +112,21 @@ contract ByzantineEurVaultIntegrationTest is Test {
 
     /* HELPERS */
 
+    /// @dev Returns the adapter's live position addresses — the per-ticket receivers the mock's
+    ///      chunked finalize must be pointed at.
+    function _adapterPositions() internal view returns (address[] memory r) {
+        uint256 n = adapter.positionsLength();
+        r = new address[](n);
+        for (uint256 i; i < n; ++i) {
+            r[i] = adapter.positions(i);
+        }
+    }
+
     /// @dev Gate-open path: Composes the two-phase finalize primitives into one call that settles the active EUR-vault
-    ///      batch for the adapter only.
+    ///      batch for the adapter's positions only.
     /// @dev Use this when the test does NOT need to observe claimable state.
     function _settleAdapterBatch() internal {
-        address[] memory r = new address[](1);
-        r[0] = address(adapter);
+        address[] memory r = _adapterPositions();
         eurVault.executeDnt();
         eurVault.processDepositChunk(r, type(uint256).max);
         eurVault.processWithdrawChunk(r, type(uint256).max);
@@ -124,8 +134,7 @@ contract ByzantineEurVaultIntegrationTest is Test {
     }
 
     /// @dev Gate-blocked path: Same as `_settleAdapterBatch` but flips both gate flags to set the gate-blocked path
-    ///      so settlement routes via `claimableShares` / `claimableEurc`.
-    /// @dev Use this when the test needs to exercise the adapter's `_pullClaimableShares` / `_pullClaimableEurc` paths.
+    ///      so settlement routes via `claimableShares` / `claimableEurc` (keyed to the positions).
     function _settleAdapterBatchToClaimable() internal {
         // Flip the gate flags to the gate-blocked path
         eurVault.setReceiveSharesBlocked(true);
@@ -134,6 +143,13 @@ contract ByzantineEurVaultIntegrationTest is Test {
         // Reset the gate flags to the default (gate-open)
         eurVault.setReceiveSharesBlocked(false);
         eurVault.setReceiveAssetsBlocked(false);
+    }
+
+    /// @dev Settles the active batch and sweeps the settled positions home, so the proceeds (bpEUR /
+    ///      EURC) end up on the adapter itself.
+    function _settleAndSweep() internal {
+        _settleAdapterBatch();
+        adapter.sweepSettled(type(uint256).max);
     }
 
     /// @dev Returns the batchId that will be used by the adapter on the next `allocate` / `requestWithdraw`.

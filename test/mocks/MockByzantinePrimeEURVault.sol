@@ -5,6 +5,7 @@ pragma solidity ^0.8.0;
 import {ERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "../../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {IByzantinePrimeEURVault} from "../../src/interfaces/IByzantinePrimeEURVault.sol";
+import {IReceiveSharesGate, ISendSharesGate, IReceiveAssetsGate, ISendAssetsGate} from "../../src/interfaces/IGate.sol";
 
 /// @title MockByzantinePrimeEURVault
 /// @notice Mock implementation of an async EUR vault used by ByzantineEurVaultAdapter.
@@ -22,6 +23,14 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     /// @dev Custom errors
     error ZeroAssets();
     error ZeroShares();
+
+    /// @dev Gate errors, mirroring the real vault's.
+    error SendAssetsBlocked();
+    error ReceiveSharesBlocked();
+    error SendSharesBlocked();
+    error ReceiveAssetsBlocked();
+    error CannotSendShares();
+    error CannotReceiveShares();
 
     /// @dev Mirrors the real ByzantinePrimeEURVault: bpEUR has 18 decimals, EURC has 6.
     uint256 private constant ONE_SHARE = 1e18;
@@ -79,6 +88,12 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     bool public receiveSharesBlocked;
     bool public receiveAssetsBlocked;
 
+    /// @dev Gate addresses mirroring the real vault's storage. `address(0)` = gateless (default).
+    address public receiveSharesGate;
+    address public sendSharesGate;
+    address public receiveAssetsGate;
+    address public sendAssetsGate;
+
     /// @dev DNT snapshot, populated by `executeDnt` and cleared by `closeBatch`. Mirrors the real vault's
     ///      `dntNavEffEurc` / `dntSupplyPreBatch`. `_dntBatchId == 0` means "no snapshot active"
     uint256 internal _dntNavSnapshot;
@@ -121,6 +136,31 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         return _claimableEurc[owner];
     }
 
+    /// @dev Mirrors the real vault's gate checks: `address(0)` = gateless.
+    function canReceiveShares(address receiver) public view returns (bool) {
+        address gate = receiveSharesGate;
+        if (gate == address(0)) return true;
+        return IReceiveSharesGate(gate).canReceiveShares(receiver);
+    }
+
+    function canSendShares(address sender) public view returns (bool) {
+        address gate = sendSharesGate;
+        if (gate == address(0)) return true;
+        return ISendSharesGate(gate).canSendShares(sender);
+    }
+
+    function canReceiveAssets(address receiver) public view returns (bool) {
+        address gate = receiveAssetsGate;
+        if (gate == address(0)) return true;
+        return IReceiveAssetsGate(gate).canReceiveAssets(receiver);
+    }
+
+    function canSendAssets(address sender) public view returns (bool) {
+        address gate = sendAssetsGate;
+        if (gate == address(0)) return true;
+        return ISendAssetsGate(gate).canSendAssets(sender);
+    }
+
     /// @dev When a DNT snapshot is active, conversions read the locked NAV/supply so
     ///      PPS quotes are stable across chunked finalization
     function convertToAssets(uint256 shares) public view override returns (uint256) {
@@ -137,12 +177,23 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         return (assets * supply) / nav;
     }
 
+    /// @dev Mirrors the real vault: `convertToAssets` minus the protocol withdraw fee (ceil),
+    ///      reading the CURRENT `withdrawFeeBps`. Does not include swap fee / budget haircuts.
+    function previewRedeemNetAssets(uint256 shares) external view override returns (uint256) {
+        if (shares == 0) return 0;
+        uint256 grossAssets = convertToAssets(shares);
+        uint256 fee = _withdrawFeeBps == 0 ? 0 : _mulDivUp(grossAssets, _withdrawFeeBps, 10_000);
+        return grossAssets - fee;
+    }
+
     /* EXTERNAL FUNCTIONS */
 
     /// @dev pulls `assets` of EURC, applies the deposit fee (mulDivUp), queues net for the active batch.
     ///      Active batch matches the adapter's `_activeBatchId`: currentBatchId when idle, nextBatchId in DNT.
     function requestDeposit(uint256 assets, address receiver) external override {
         if (assets == 0) revert ZeroAssets();
+        if (!canSendAssets(msg.sender)) revert SendAssetsBlocked();
+        if (!canReceiveShares(receiver)) revert ReceiveSharesBlocked();
         IERC20(asset).transferFrom(msg.sender, address(this), assets);
         uint256 fee = _mulDivUp(assets, _depositFeeBps, 10_000);
         uint256 net = assets - fee;
@@ -155,6 +206,8 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     /// @dev burns `shares` from `owner` immediately and records the queued payout for `receiver`.
     function requestWithdraw(uint256 shares, address receiver, address owner) external override {
         if (shares == 0) revert ZeroShares();
+        if (!canSendShares(owner)) revert SendSharesBlocked();
+        if (!canReceiveAssets(receiver)) revert ReceiveAssetsBlocked();
         if (owner != msg.sender) {
             uint256 allowed = allowance(owner, msg.sender);
             if (allowed != type(uint256).max) _approve(owner, msg.sender, allowed - shares);
@@ -165,19 +218,21 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         batchUserWithdraw[batchId][receiver] += shares;
     }
 
-    /// @dev Reads `_claimableShares[receiver]` and transfers the shares to `receiver`.
+    /// @dev Mirrors the real vault: claims `msg.sender`'s claimable shares and sends them to `receiver`.
     function claimDepositShares(address receiver) external override {
-        uint256 amount = _claimableShares[receiver];
+        if (!canReceiveShares(receiver)) revert ReceiveSharesBlocked();
+        uint256 amount = _claimableShares[msg.sender];
         require(amount > 0, "nothing claimable");
-        _claimableShares[receiver] = 0;
+        _claimableShares[msg.sender] = 0;
         _transfer(address(this), receiver, amount);
     }
 
-    /// @dev Same `owner == receiver` convention as `claimDepositShares`.
+    /// @dev Mirrors the real vault: claims `msg.sender`'s claimable EURC and sends it to `receiver`.
     function claimWithdraw(address receiver) external override {
-        uint256 amount = _claimableEurc[receiver];
+        if (!canReceiveAssets(receiver)) revert ReceiveAssetsBlocked();
+        uint256 amount = _claimableEurc[msg.sender];
         require(amount > 0, "nothing claimable");
-        _claimableEurc[receiver] = 0;
+        _claimableEurc[msg.sender] = 0;
         IERC20(asset).transfer(receiver, amount);
     }
 
@@ -214,7 +269,7 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
             uint256 sharesToMint = _dntSupplySnapshot == 0
                 ? (effectiveAssets * ONE_SHARE) / ONE_STABLE
                 : (effectiveAssets * _dntSupplySnapshot) / _dntNavSnapshot;
-            if (receiveSharesBlocked) {
+            if (receiveSharesBlocked || !canReceiveShares(rec)) {
                 _mint(address(this), sharesToMint);
                 _claimableShares[rec] += sharesToMint;
             } else {
@@ -249,7 +304,7 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
             uint256 afterSwap = swapFee == 0 ? owed : (owed * (10_000 - swapFee)) / 10_000;
             uint256 fee = feeBps == 0 ? 0 : _mulDivUp(afterSwap, feeBps, 10_000);
             uint256 toPay = afterSwap - fee;
-            if (receiveAssetsBlocked) {
+            if (receiveAssetsBlocked || !canReceiveAssets(rec)) {
                 _claimableEurc[rec] += toPay;
             } else {
                 IERC20(asset).transfer(rec, toPay);
@@ -287,6 +342,19 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         receiveAssetsBlocked = blocked;
     }
 
+    /// @dev Mirrors the real vault's `setGates` (no governance / vault-state check in the mock).
+    function setGates(
+        address _receiveSharesGate,
+        address _sendSharesGate,
+        address _receiveAssetsGate,
+        address _sendAssetsGate
+    ) external {
+        receiveSharesGate = _receiveSharesGate;
+        sendSharesGate = _sendSharesGate;
+        receiveAssetsGate = _receiveAssetsGate;
+        sendAssetsGate = _sendAssetsGate;
+    }
+
     /* SETTER FUNCTIONS */
 
     /// @dev Low-level state-only toggle. Does NOT populate the DNT snapshot — use `executeDnt` for that.
@@ -321,6 +389,13 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
     }
 
     /* INTERNAL FUNCTIONS */
+
+    /// @dev Mirrors the real vault's `_update`: every bpEUR transfer (incl. mints) is gated.
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0) && !canSendShares(from)) revert CannotSendShares();
+        if (to != address(0) && !canReceiveShares(to)) revert CannotReceiveShares();
+        super._update(from, to, value);
+    }
 
     function _targetBatchId() internal view returns (uint256) {
         return vaultState == VaultState.NormalIdle ? currentBatchId : currentBatchId + 1;
