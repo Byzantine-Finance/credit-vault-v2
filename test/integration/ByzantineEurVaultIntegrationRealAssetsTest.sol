@@ -504,6 +504,55 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         assertEq(adapter.realAssets(), A1 + A2, "exact after close + final sweep");
     }
 
+    /// @notice Regression for the audited fabricated-delta understatement (Sherlock issue #7): in
+    ///         the old design, `requestDeposit` mid-DNT subtracted the outgoing EURC from EVERY open
+    ///         batch's snapshot, driving batch N+1's snapshot artificially negative; when N+1 later
+    ///         entered its own DNT, the fabricated delta cancelled its genuine pending withdrawal.
+    ///         With isolated positions there is no snapshot to corrupt: a mid-DNT deposit is just a
+    ///         new position, and batch N's payout sits untouched on its own position until close.
+    function testRealAssetsNoFabricatedDeltaFromMidDntDeposit() public {
+        uint256 SEED = 1000e6;
+        uint256 W = 400e6;
+        uint256 wShares = W * BPEUR_PER_EURC;
+
+        // Seed the adapter with 1000 EURC of bpEUR.
+        vault.deposit(SEED, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", SEED);
+        _settleAndSweep();
+
+        // Batch N: withdraw 400, then enter DNT.
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(wShares);
+        address positionW1 = adapter.positions(0);
+        eurVault.executeDnt();
+
+        // Mid-DNT: second withdraw of 400 — queues on batch N+1 in its own position.
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(wShares);
+
+        // Batch N's withdrawal settles: 400 EURC paid to positionW1 (batch NOT closed yet).
+        address[] memory r = new address[](1);
+        r[0] = positionW1;
+        eurVault.processWithdrawChunk(r, type(uint256).max);
+        assertEq(eurc.balanceOf(positionW1), W, "batch N payout isolated on its position");
+        assertApproxEqAbs(adapter.realAssets(), SEED, 1, "value preserved mid-settlement");
+
+        // The audited trigger: an outgoing EURC deposit request mid-DNT, queued on batch N+1.
+        // (External idle EURC: batch N's payout is locked on its position until the batch closes.)
+        deal(address(eurc), address(adapter), W);
+        vm.prank(adapterCurator);
+        adapter.requestDeposit(W);
+        assertApproxEqAbs(adapter.realAssets(), SEED + W, 1, "deposit added, nothing fabricated");
+
+        // Close batch N, then enter batch N+1's own DNT — where the audited design understated
+        // by the fabricated delta (~400 EURC).
+        eurVault.closeBatch();
+        eurVault.executeDnt();
+
+        assertApproxEqAbs(adapter.realAssets(), SEED + W, 1, "no understatement during batch N+1's DNT");
+    }
+
     /// @notice Same regression on the withdraw side: a withdraw requested during batch N's DNT
     ///         queues on batch N+1; after N closes silently and N+1 enters DNT, the pending withdraw
     ///         must still be fully valued.
