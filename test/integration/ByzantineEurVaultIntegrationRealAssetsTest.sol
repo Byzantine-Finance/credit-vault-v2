@@ -453,6 +453,57 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "no understatement mid-DNT of batch N+1");
     }
 
+    /// @notice Regression for the audited re-anchor double-count (Sherlock issue #4): in the old
+    ///         snapshot design, a permissionless pull during batch N+1's partial settlement
+    ///         re-anchored N+1's snapshot to balances that already included N+1's own mint,
+    ///         disabling the correction and over-stating realAssets by exactly A2 (200 instead of
+    ///         150 in the finding's walkthrough). With per-position isolation, N+1's minted bpEUR
+    ///         sit on the position (not the adapter) and the position is valued at its pending
+    ///         amount until close — no shadow left to double count, and the sweep cannot interfere.
+    function testRealAssetsNoDoubleCountAfterSweepDuringPartialSettlement() public {
+        uint256 A1 = ASSETS_100; // batch1 deposit
+        uint256 A2 = 50e6; // batch2 deposit, the amount double-counted in the finding
+
+        // Steps 1-3: allocate A1 (batch1), enter DNT, allocate A2 mid-DNT (batch2).
+        vault.deposit(A1 + A2, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", A1);
+        eurVault.executeDnt();
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", A2);
+        address position1 = adapter.positions(0);
+        address position2 = adapter.positions(1);
+
+        // Step 4: settle + close batch1 — position1 holds A1's bpEUR, "settled but still listed".
+        address[] memory r1 = new address[](1);
+        r1[0] = position1;
+        eurVault.processDepositChunk(r1, type(uint256).max);
+        eurVault.processWithdrawChunk(r1, type(uint256).max);
+        eurVault.closeBatch();
+
+        // Steps 5-6: batch2 enters DNT and its deposit chunk is processed WITHOUT closing.
+        eurVault.executeDnt();
+        address[] memory r2 = new address[](1);
+        r2[0] = position2;
+        eurVault.processDepositChunk(r2, type(uint256).max);
+        assertEq(eurVault.balanceOf(position2), A2 * BPEUR_PER_EURC, "position2 silently minted");
+
+        // The trigger of the audited bug: a permissionless sweep (analog of pullClaimableShares)
+        // while batch2 is mid-settlement. position1 is swept home; position2 must be untouched.
+        adapter.sweepSettled(type(uint256).max);
+        assertEq(eurVault.balanceOf(address(adapter)), A1 * BPEUR_PER_EURC, "A1 bpEUR swept to the adapter");
+        assertEq(adapter.positionsLength(), 1, "position2 (in-flight) survives the sweep");
+
+        // The audited design reported A1 + 2*A2 (200) here. Position isolation must report A1 + A2.
+        assertEq(adapter.realAssets(), A1 + A2, "no double count after sweep during partial settlement");
+
+        // Sanity: still exact after the batch closes and the last position is swept.
+        eurVault.processWithdrawChunk(r2, type(uint256).max);
+        eurVault.closeBatch();
+        adapter.sweepSettled(type(uint256).max);
+        assertEq(adapter.realAssets(), A1 + A2, "exact after close + final sweep");
+    }
+
     /// @notice Same regression on the withdraw side: a withdraw requested during batch N's DNT
     ///         queues on batch N+1; after N closes silently and N+1 enters DNT, the pending withdraw
     ///         must still be fully valued.
