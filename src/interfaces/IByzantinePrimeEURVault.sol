@@ -19,6 +19,10 @@ interface IByzantinePrimeEURVault {
     function convertToAssets(uint256 shares) external view returns (uint256);
     function claimableEurc(address owner) external view returns (uint256);
     function claimableShares(address owner) external view returns (uint256);
+    function receiveSharesGate() external view returns (address);
+    function sendSharesGate() external view returns (address);
+    function receiveAssetsGate() external view returns (address);
+    function sendAssetsGate() external view returns (address);
 
     /* FUNCTIONS */
 

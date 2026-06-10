@@ -11,6 +11,7 @@ import {IVaultV2} from "../interfaces/IVaultV2.sol";
 import {EurVaultPosition} from "./EurVaultPosition.sol";
 import {IEurVaultPosition} from "./interfaces/IEurVaultPosition.sol";
 import {Clones} from "../../lib/openzeppelin-contracts/contracts/proxy/Clones.sol";
+import {ICloneWhitelistGate} from "../interfaces/IGate.sol";
 
 /// @dev Every ByzantineEURVault request (deposit or withdraw) is isolated in its own `EurVaultPosition`
 ///      minimal-proxy clone, which is the owner and receiver of its single ticket. Settlement
@@ -130,7 +131,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // Only allowed to withdraw shares the adapter actually holds
         require(IERC20(eurVault).balanceOf(address(this)) >= shares, InsufficientShares());
 
-        address position = Clones.cloneDeterministic(positionImplementation, bytes32(positionNonce++));
+        address position = _createPosition();
         SafeERC20Lib.safeTransfer(eurVault, position, shares);
         uint256 batchId = IEurVaultPosition(position).initWithdraw(shares);
         positions.push(position);
@@ -196,12 +197,46 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /* INTERNAL FUNCTIONS */
 
+    /// @dev Clones a fresh position and whitelists it on the EUR vault's active gates.
+    /// @dev The gates are read live from the EUR vault (single source of truth: a gate rotation via
+    ///      `setGates` is picked up automatically). `address(0)` (gateless) entries are skipped and
+    ///      duplicates are whitelisted once (the same gate often serves several roles). Each active
+    ///      gate must register this adapter as a trusted cloner of `positionImplementation`,
+    ///      otherwise position creation reverts.
+    function _createPosition() internal returns (address position) {
+        bytes32 salt = bytes32(positionNonce++);
+        position = Clones.cloneDeterministic(positionImplementation, salt);
+
+        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
+        address[4] memory gates = [v.receiveSharesGate(), v.sendSharesGate(), v.receiveAssetsGate(), v.sendAssetsGate()];
+        for (uint256 i; i < 4;) {
+            address gate = gates[i];
+            if (gate != address(0) && !_seenBefore(gates, gate, i)) {
+                ICloneWhitelistGate(gate).setIsCloneWhitelisted(salt, true);
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev True if `gate` already appears in `gates[0..i)`.
+    function _seenBefore(address[4] memory gates, address gate, uint256 i) internal pure returns (bool) {
+        for (uint256 j; j < i;) {
+            if (gates[j] == gate) return true;
+            unchecked {
+                ++j;
+            }
+        }
+        return false;
+    }
+
     /// @dev Clones a fresh position, funds it with `assets` EURC and opens its deposit ticket.
     function _openDepositPosition(uint256 assets)
         internal
         returns (address position, uint256 batchId, uint256 netAssets)
     {
-        position = Clones.cloneDeterministic(positionImplementation, bytes32(positionNonce++));
+        position = _createPosition();
         SafeERC20Lib.safeTransfer(asset, position, assets);
         (batchId, netAssets) = IEurVaultPosition(position).initDeposit(assets);
         positions.push(position);
