@@ -553,6 +553,28 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         assertApproxEqAbs(adapter.realAssets(), SEED + W, 1, "no understatement during batch N+1's DNT");
     }
 
+    /// @notice Regression for the audited bpEUR-injection undercount (Sherlock issue #11): in the
+    ///         old design, bpEUR sent directly to the adapter inflated the `current − snapshot`
+    ///         delta, which was misread as the current batch's settled deposit and zeroed its
+    ///         pending shadow (reporting 100 instead of 200 in the finding's walkthrough). Pendings
+    ///         now live on isolated positions and are never reduced by the adapter's balance: an
+    ///         injection can only ADD value (upward direction, smoothed by the parent's maxRate).
+    function testRealAssetsInjectedBpEurDoesNotCancelPendingDeposit() public {
+        // Pending deposit of 100 on the current batch.
+        vault.deposit(ASSETS_100, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", ASSETS_100);
+
+        // A third party injects 100 EURC worth of bpEUR directly onto the ADAPTER.
+        deal(address(eurVault), address(adapter), ASSETS_100 * BPEUR_PER_EURC);
+        assertEq(adapter.realAssets(), 2 * ASSETS_100, "pre-DNT: injected value + pending deposit");
+
+        // DNT starts before the adapter's ticket settles — the audited code misread the injected
+        // bpEUR as the settled ticket right here and dropped to 100.
+        eurVault.executeDnt();
+        assertEq(adapter.realAssets(), 2 * ASSETS_100, "mid-DNT: injection cannot cancel the pending deposit");
+    }
+
     /// @notice Same regression on the withdraw side: a withdraw requested during batch N's DNT
     ///         queues on batch N+1; after N closes silently and N+1 enters DNT, the pending withdraw
     ///         must still be fully valued.
