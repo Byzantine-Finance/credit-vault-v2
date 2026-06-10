@@ -5,14 +5,18 @@ pragma solidity 0.8.28;
 
 import {IERC20} from "../interfaces/IERC20.sol";
 import {SafeERC20Lib} from "../libraries/SafeERC20Lib.sol";
-import {MathLib} from "../libraries/MathLib.sol";
 import {IByzantinePrimeEURVault} from "../interfaces/IByzantinePrimeEURVault.sol";
 import {IByzantineEurVaultAdapter} from "./interfaces/IByzantineEurVaultAdapter.sol";
 import {IVaultV2} from "../interfaces/IVaultV2.sol";
+import {EurVaultPosition} from "./EurVaultPosition.sol";
+import {IEurVaultPosition} from "./interfaces/IEurVaultPosition.sol";
+import {Clones} from "../../lib/openzeppelin-contracts/contracts/proxy/Clones.sol";
 
+/// @dev Every ByzantineEURVault request (deposit or withdraw) is isolated in its own `EurVaultPosition`
+///      minimal-proxy clone, which is the owner and receiver of its single ticket. Settlement
+///      detection is close-based (`currentBatchId() > position.batchId`) and `realAssets()` reads each
+///      position in isolation.
 contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
-    using MathLib for uint256;
-
     /* IMMUTABLES */
 
     address public immutable factory;
@@ -20,17 +24,18 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     address public immutable eurVault;
     address public immutable asset;
     bytes32 public immutable adapterId;
+    address public immutable positionImplementation;
 
     /* STORAGE */
 
     address public skimRecipient;
     address public adapterCurator;
 
-    /// @dev Per-batch accounting state. Struct defined in `IByzantineEurVaultAdapter`.
-    mapping(uint256 batchId => BatchAccounting) public batchAccounting;
+    /// @dev Live positions (not yet swept). Settled ones are swept and removed by `_sweepSettled`.
+    address[] public positions;
 
-    /// @dev Batches the adapter has pending state for
-    uint256[] public openBatchIds;
+    /// @dev CREATE2 salt counter, so position addresses are predictable
+    uint256 public positionNonce;
 
     /* CONSTRUCTOR */
 
@@ -41,53 +46,36 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         asset = IVaultV2(_parentVault).asset();
         require(asset == IByzantinePrimeEURVault(_eurVault).asset(), AssetMismatch());
         adapterId = keccak256(abi.encode("this", address(this)));
-        SafeERC20Lib.safeApprove(asset, _eurVault, type(uint256).max);
+        positionImplementation = address(new EurVaultPosition(_eurVault, asset));
         SafeERC20Lib.safeApprove(asset, _parentVault, type(uint256).max);
     }
 
     /* EXTERNAL FUNCTIONS */
 
-    /// @dev Allocates `assets` to the adapter and calls requestDeposit on the EUR vault.
-    /// @dev Assets are transferred immediately to the adapter while bpEUR shares are minted at the next DNT settlement.
+    /// @dev Allocates `assets` to the adapter and opens a deposit position on the EUR vault.
+    /// @dev Assets are transferred immediately to the EUR vault while bpEUR shares are minted to the
+    ///      position contract at the next DNT settlement.
     function allocate(bytes memory data, uint256 assets, bytes4, address) external returns (bytes32[] memory, int256) {
         require(msg.sender == parentVault, NotAuthorized());
         require(data.length == 0, InvalidData());
 
-        // Transfer the assets to the EUR vault
-        if (assets > 0) IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
+        // Sweep settled positions home before opening a new one.
+        _sweepSettled(type(uint256).max);
 
-        // Clean up settled batches in openBatchIds
-        _clearSettledBatches();
-
-        // Get the active batch id
-        uint256 batchId = _activeBatchId();
-
-        // The EUR vault deducts depositFeeBps on requestDeposit. Record the net
-        // amount so realAssets reflects what we actually expect back as shares
-        uint256 netAssets = _netAssetsAfterDepositFee(assets);
-        BatchAccounting storage acc = batchAccounting[batchId];
-        // forge-lint: disable-next-line(unsafe-typecast) `netAssets` is bounded by EURC supply.
-        acc.pendingDepositEurc += uint128(netAssets);
-
-        // If the batch is not open, snapshot balances and add it to the open batch ids.
-        if (!acc.isOpen) {
-            _snapshotBalancesForBatch(batchId);
-            openBatchIds.push(batchId);
-            acc.isOpen = true;
+        if (assets != 0) {
+            (address position, uint256 batchId, uint256 netAssets) = _openDepositPosition(assets);
+            emit Allocate(position, batchId, assets, netAssets);
         }
 
-        // newAllocation reflects the position right after requestDeposit
         uint256 oldAllocation = allocation();
         uint256 newAllocation = _realAssets();
-
-        emit Allocate(batchId, assets, netAssets);
 
         // forge-lint: disable-next-item(unsafe-typecast) safe because ByzantinePrimeEURVault's position
         // is bounded by EURC's total supply, and allocation is less than the max total assets of the vault.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
-    /// @dev Allows deallocation only if the adapter has enough idle EURC.
+    /// @dev Allows deallocation only if the adapter has enough idle EURC (after sweeping settled positions home).
     function deallocate(bytes memory data, uint256 assets, bytes4, address)
         external
         returns (bytes32[] memory, int256)
@@ -95,11 +83,8 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         require(msg.sender == parentVault, NotAuthorized());
         require(data.length == 0, InvalidData());
 
-        // Clean up settled batches in openBatchIds
-        _clearSettledBatches();
-
-        // Pulls any claimable EURC so the adapter can include it in the deallocation
-        _pullClaimableEurc();
+        // Sweep settled positions so their EURC proceeds are available for the deallocation.
+        _sweepSettled(type(uint256).max);
 
         // Only allowed to deallocate if the adapter has enough idle EURC
         require(IERC20(asset).balanceOf(address(this)) >= assets, InsufficientIdle());
@@ -107,10 +92,6 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // Reflects the post-transfer state: current realAssets minus the assets VaultV2 is about to pull
         uint256 oldAllocation = allocation();
         uint256 newAllocation = _realAssets() - assets;
-
-        // `assets` will be transfered out from the adapter
-        // Adjust snapshots now so `_realAssets` call observe a consistent state.
-        _adjustEurcSnapshotOnTransferOut(assets);
 
         emit Deallocate(assets);
 
@@ -121,78 +102,40 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /// @dev Callable by adapter curator only.
     /// @dev Deposits `assets` of idle EURC held by the adapter into the EUR vault to earn yield.
-    ///      The EURC leaves the adapter immediately while bpEUR shares are minted at the next DNT settlement.
+    ///      The EURC leaves the adapter immediately while bpEUR shares are minted to the position contract at
+    ///      the next DNT settlement.
     function requestDeposit(uint256 assets) external {
         require(msg.sender == adapterCurator, NotAuthorized());
 
-        // Clean up settled batches in openBatchIds
-        _clearSettledBatches();
-
-        // Pulls any claimable EURC so the adapter can include it in the deposit
-        _pullClaimableEurc();
+        // Sweep settled positions so their EURC proceeds can be redeployed in this deposit.
+        _sweepSettled(type(uint256).max);
 
         // Only allowed to deposit if the adapter has enough idle EURC
         require(IERC20(asset).balanceOf(address(this)) >= assets, InsufficientIdle());
 
-        // Transfer the assets to the EUR vault. Reverts on zero assets via the vault's own check.
-        IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
+        (address position, uint256 batchId, uint256 netAssets) = _openDepositPosition(assets);
 
-        // `assets` left the adapter to the EUR vault.
-        // Adjust EURC snapshots of existing open batches so future settlement-delta calculations remain consistent.
-        _adjustEurcSnapshotOnTransferOut(assets);
-
-        // Get the active batch id
-        uint256 batchId = _activeBatchId();
-
-        // The EUR vault deducts depositFeeBps on requestDeposit. Record the net
-        // amount so realAssets reflects what we actually expect back as shares
-        uint256 netAssets = _netAssetsAfterDepositFee(assets);
-        BatchAccounting storage acc = batchAccounting[batchId];
-        // forge-lint: disable-next-line(unsafe-typecast) `netAssets` is bounded by EURC supply.
-        acc.pendingDepositEurc += uint128(netAssets);
-
-        // If the batch is not open, snapshot balances and add it to the open batch ids.
-        if (!acc.isOpen) {
-            _snapshotBalancesForBatch(batchId);
-            openBatchIds.push(batchId);
-            acc.isOpen = true;
-        }
-
-        emit RequestDeposit(batchId, assets, netAssets);
+        emit RequestDeposit(position, batchId, assets, netAssets);
     }
 
     /// @dev Callable by adapter curator only.
-    /// @dev bpEUR shares are burned immediately while withdrawn assets are transferred to the adapter at the next DNT
-    ///      settlement.
+    /// @dev bpEUR shares are burned immediately while withdrawn assets are transferred to the position contract
+    ///      at the next DNT settlement.
     function requestWithdraw(uint256 shares) external {
         require(msg.sender == adapterCurator, NotAuthorized());
 
-        // Clean up settled batches in openBatchIds
-        _clearSettledBatches();
+        // Sweep settled positions so their bpEUR proceeds can be included in this withdrawal.
+        _sweepSettled(type(uint256).max);
 
-        // Pulls any claimable bpEUR shares so the adapter can include them in the request
-        _pullClaimableShares();
+        // Only allowed to withdraw shares the adapter actually holds
+        require(IERC20(eurVault).balanceOf(address(this)) >= shares, InsufficientShares());
 
-        // Burns `shares` bpEUR from the adapter immediately and queues the request.
-        IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
+        address position = Clones.cloneDeterministic(positionImplementation, bytes32(positionNonce++));
+        SafeERC20Lib.safeTransfer(eurVault, position, shares);
+        uint256 batchId = IEurVaultPosition(position).initWithdraw(shares);
+        positions.push(position);
 
-        // `shares` will be burned from the adapter
-        // Adjust snapshots now so `_realAssets` (called below) and any subsequent call observe a consistent state.
-        _adjustSharesSnapshotsOnBurn(shares);
-
-        // Get the active batch id
-        uint256 batchId = _activeBatchId();
-
-        // If the batch is not open, snapshot balances and add it to the open batch ids.
-        BatchAccounting storage acc = batchAccounting[batchId];
-        if (!acc.isOpen) {
-            _snapshotBalancesForBatch(batchId);
-            openBatchIds.push(batchId);
-            acc.isOpen = true;
-        }
-        acc.pendingWithdrawShares += shares;
-
-        emit RequestWithdraw(batchId, shares);
+        emit RequestWithdraw(position, batchId, shares);
     }
 
     function setAdapterCurator(address newAdapterCurator) external {
@@ -220,16 +163,12 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
 
     /* PERMISSIONLESS FUNCTIONS */
 
-    /// @dev Pulls claimable bpEUR shares from the EUR vault and clear settled batches as a side-effect.
-    function pullClaimableShares() external {
-        _clearSettledBatches();
-        _pullClaimableShares();
-    }
-
-    /// @dev Pulls claimable EURC from the EUR vault and clear settled batches as a side-effect.
-    function pullClaimableEurc() external {
-        _clearSettledBatches();
-        _pullClaimableEurc();
+    /// @dev Sweeps settled positions back to the adapter. Permissionless: proceeds can only move
+    ///      from a position to the adapter.
+    /// @param maxPositions Bounds the loop so the call cannot run out of gas when many positions
+    ///        are settled; pass `type(uint256).max` to sweep everything.
+    function sweepSettled(uint256 maxPositions) external {
+        _sweepSettled(maxPositions);
     }
 
     /* VIEWS */
@@ -250,186 +189,41 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         return _realAssets();
     }
 
-    /// @dev Returns the number of open batch ids
-    function openBatchIdsLength() external view returns (uint256) {
-        return openBatchIds.length;
+    /// @dev Returns the number of live (not yet swept) positions
+    function positionsLength() external view returns (uint256) {
+        return positions.length;
     }
 
     /* INTERNAL FUNCTIONS */
 
-    /// @dev Returns the active batch id in the Byzantine EUR vault
-    function _activeBatchId() internal view returns (uint256) {
-        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
-        return v.vaultState() == IByzantinePrimeEURVault.VaultState.NormalIdle ? v.currentBatchId() : v.nextBatchId();
+    /// @dev Clones a fresh position, funds it with `assets` EURC and opens its deposit ticket.
+    function _openDepositPosition(uint256 assets)
+        internal
+        returns (address position, uint256 batchId, uint256 netAssets)
+    {
+        position = Clones.cloneDeterministic(positionImplementation, bytes32(positionNonce++));
+        SafeERC20Lib.safeTransfer(asset, position, assets);
+        (batchId, netAssets) = IEurVaultPosition(position).initDeposit(assets);
+        positions.push(position);
     }
 
-    /// @dev ceil(assets * bps / 10_000), matching ByzantinePrimeEURVault.requestDeposit
-    /// @dev Used to increment `pendingDepositEurc` in `allocate`
-    function _netAssetsAfterDepositFee(uint256 assets) internal view returns (uint256) {
-        uint256 bps = IByzantinePrimeEURVault(eurVault).depositFeeBps();
-        if (bps == 0) return assets;
-        // Calculate the deposit fee
-        uint256 fee = assets.mulDivUp(bps, 10_000);
-        return assets - fee;
-    }
-
-    /// @dev Reads the adapter's current bpEUR and EURC balances and adds the claimable tokens in the EUR vault.
-    function _currentBalances() internal view returns (uint256 shares, uint256 eurc) {
-        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
-        shares = IERC20(eurVault).balanceOf(address(this)) + v.claimableShares(address(this));
-        eurc = IERC20(asset).balanceOf(address(this)) + v.claimableEurc(address(this));
-    }
-
-    /// @dev Snapshots `(shares, eurc)` at batch open for `batchId`. Called when the batch is first added
-    ///      to `openBatchIds`, so `_realAssets` can compute the passive delta attributable to this batch's
-    ///      settlement as `int256(current) - acc.sharesSnapshotAtBatch` (resp. `acc.eurcSnapshotAtBatch`).
-    // forge-lint: disable-next-item(unsafe-typecast) bpEUR and EURC supplies are bounded far below 2^255.
-    function _snapshotBalancesForBatch(uint256 batchId) internal {
-        (uint256 shares, uint256 eurc) = _currentBalances();
-        BatchAccounting storage acc = batchAccounting[batchId];
-        acc.sharesSnapshotAtBatch = int256(shares);
-        acc.eurcSnapshotAtBatch = int128(int256(eurc));
-    }
-
-    /// @dev Decrements every open batch's `sharesSnapshotAtBatch` by `shares` after a burn (requestWithdraw).
-    ///      The signed encoding allows the snapshot to drop below zero when the burn exceeds it, allowing accounting of
-    ///      any deficit.
-    // forge-lint: disable-next-item(unsafe-typecast) `shares` is bounded by bpEUR supply.
-    function _adjustSharesSnapshotsOnBurn(uint256 shares) internal {
-        int256 sharesInt = int256(shares);
-        uint256 length = openBatchIds.length;
-        for (uint256 i; i < length;) {
-            batchAccounting[openBatchIds[i]].sharesSnapshotAtBatch -= sharesInt;
-            unchecked {
-                ++i;
-            }
-        }
-    }
-
-    /// @dev Decrements every open batch's `eurcSnapshotAtBatch` by `amount` before an outgoing EURC transfer.
-    ///      Same signed-encoding rationale as `_adjustSharesSnapshotsOnBurn`.
-    // forge-lint: disable-next-item(unsafe-typecast) `amount` is bounded by EURC supply.
-    function _adjustEurcSnapshotOnTransferOut(uint256 amount) internal {
-        int128 amountInt = int128(int256(amount));
-        uint256 length = openBatchIds.length;
-        for (uint256 i; i < length;) {
-            batchAccounting[openBatchIds[i]].eurcSnapshotAtBatch -= amountInt;
-            unchecked {
-                ++i;
-            }
-        }
-    }
-
-    /// @dev `realAssets` is the sum of:
-    /// (A) idle EURC on the adapter + claimable EURC on the EUR vault
-    /// (B) convertToAssets(sharesBalance + claimable shares on the EUR vault)
-    /// (C) pending deposit EURC - summed over open EUR-vault batches not yet settled,
-    /// (D) convertToAssets(pendingWithdrawShares) - summed over the same set.
-    /// @dev For the batch currently being settled by the EUR vault (`currentBatchId` during `DntInProgress`),
-    ///      (C) and (D) are reduced by the portion that has already been minted/transferred to the adapter
-    ///      This is detected via `current - snapshot` deltas and avoids the
-    ///      double-counting that would otherwise occur between ticket processing and batch close.
-    /// @dev Known imprecision: during the active-settlement window of a batch, `realAssets()` may
-    ///      transiently over-state by at most
-    ///        (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) ×
-    ///        batchAccounting[currentBatchId].pendingDepositEurc
-    ///      (and symmetrically on the withdraw side). This residue corresponds to the hedge-partner
-    ///      swap fee that is only realized off-chain and cannot be pre-deducted because the per-batch
-    ///      netting ratio is unknown until DNT execute.
-    /// @dev All `int256(uint256)` casts are bounded by token supplies (far below 2^255); the symmetric
-    ///      `uint256(int256)` casts are guarded by an explicit positivity check, so the function-level
-    ///      `disable-next-item(unsafe-typecast)` below is safe.
-    // forge-lint: disable-next-item(unsafe-typecast)
-    function _realAssets() internal view returns (uint256 total) {
-        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
-
-        (uint256 currentShares, uint256 currentEurc) = _currentBalances();
-
-        // (A) idle EURC + claimable EURC
-        total = currentEurc;
-
-        // (B) bpEUR position value (adapter-held + claimable, both convert at the same rate)
-        if (currentShares != 0) total += v.convertToAssets(currentShares);
-
-        uint256 closedBelow = v.currentBatchId();
-        bool isDnt = v.vaultState() == IByzantinePrimeEURVault.VaultState.DntInProgress;
-        uint256 length = openBatchIds.length;
-
-        for (uint256 i; i < length;) {
-            uint256 batchId = openBatchIds[i];
-            // Batch not yet or currently being settled.
-            if (batchId >= closedBelow) {
-                BatchAccounting storage acc = batchAccounting[batchId];
-                uint256 pendingDepEurc = acc.pendingDepositEurc; // (C)
-                uint256 pendingWithShares = acc.pendingWithdrawShares;
-                uint256 pendingWithEurc = pendingWithShares != 0 ? v.convertToAssets(pendingWithShares) : 0; // (D)
-
-                // Batch currently being settled by the EUR vault
-                // Track edge case where tickets are processed but batch is not closed.
-                if (isDnt && batchId == closedBelow) {
-                    // Check if any deposit tickets have silently processed
-                    int256 currentSharesInt = int256(currentShares);
-                    int256 sharesSnapshot = acc.sharesSnapshotAtBatch;
-                    uint256 sharesDelta =
-                        currentSharesInt > sharesSnapshot ? uint256(currentSharesInt - sharesSnapshot) : 0;
-                    uint256 eurcDelta = sharesDelta != 0 ? v.convertToAssets(sharesDelta) : 0;
-                    pendingDepEurc = pendingDepEurc > eurcDelta ? pendingDepEurc - eurcDelta : 0;
-
-                    // Check if any withdraw tickets have silently processed
-                    int256 currentEurcInt = int256(currentEurc);
-                    int256 eurcSnapshot = acc.eurcSnapshotAtBatch;
-                    eurcDelta = currentEurcInt > eurcSnapshot ? uint256(currentEurcInt - eurcSnapshot) : 0;
-                    pendingWithEurc = pendingWithEurc > eurcDelta ? pendingWithEurc - eurcDelta : 0;
-                }
-
-                total += pendingDepEurc + pendingWithEurc;
-            }
-            unchecked {
-                ++i;
-            }
-        }
-    }
-
-    /// @dev Pulls claimable bpEUR shares from the EUR vault
-    function _pullClaimableShares() internal {
-        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
-        uint256 shares = v.claimableShares(address(this));
-        if (shares == 0) return;
-        v.claimDepositShares(address(this));
-        emit PullClaimableShares(shares);
-    }
-
-    /// @dev Pulls claimable EURC from the EUR vault
-    function _pullClaimableEurc() internal {
-        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
-        uint256 amount = v.claimableEurc(address(this));
-        if (amount == 0) return;
-        v.claimWithdraw(address(this));
-        emit PullClaimableEurc(amount);
-    }
-
-    /// @dev Removes entries from `openBatchIds` whose batchId have been settled, zeroing its storage.
-    ///      After clearing, re-anchors the snapshots of the remaining open batches to the current state.
-    /// @dev Called automatically by allocate/deallocate/requestWithdraw/pullClaimable*.
-    /// @dev The re-anchor casts are bounded by token supplies (far below 2^255).
-    /// forge-lint: disable-next-item(unsafe-typecast)
-    function _clearSettledBatches() internal {
-        // Get the current batch id from the EUR vault
-        uint256 closedBelow = IByzantinePrimeEURVault(eurVault).currentBatchId();
-        bool anyCleared;
+    /// @dev Sweeps up to `maxPositions` settled positions (claims + transfers their proceeds to the
+    ///      adapter) and removes them from `positions` (swap-and-pop).
+    function _sweepSettled(uint256 maxPositions) internal {
         uint256 i;
-
-        while (i < openBatchIds.length) {
-            uint256 batchId = openBatchIds[i];
-            if (batchId < closedBelow) {
-                // Zero out all batch storage
-                delete batchAccounting[batchId];
+        uint256 swept;
+        while (i < positions.length && swept < maxPositions) {
+            IEurVaultPosition position = IEurVaultPosition(positions[i]);
+            if (position.settled()) {
+                (uint256 shares, uint256 eurc) = position.sweep();
+                emit SweepPosition(address(position), shares, eurc);
                 // Swap the last element into the current position and pop the last element
-                uint256 lastIndex = openBatchIds.length - 1;
-                if (i != lastIndex) openBatchIds[i] = openBatchIds[lastIndex];
-                openBatchIds.pop();
-                anyCleared = true;
-                emit ClearId(batchId);
+                uint256 lastIndex = positions.length - 1;
+                if (i != lastIndex) positions[i] = positions[lastIndex];
+                positions.pop();
+                unchecked {
+                    ++swept;
+                }
                 // Re-check the swapped-in element at index i; do not increment.
             } else {
                 unchecked {
@@ -437,20 +231,27 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
                 }
             }
         }
+    }
 
-        // Re-anchor snapshots of remaining batches to the current state
-        uint256 remaining = openBatchIds.length;
-        if (anyCleared && remaining != 0) {
-            (uint256 bp, uint256 eurc) = _currentBalances();
-            int256 bpInt = int256(bp);
-            int128 eurcInt = int128(int256(eurc));
-            for (i = 0; i < remaining;) {
-                BatchAccounting storage acc = batchAccounting[openBatchIds[i]];
-                acc.sharesSnapshotAtBatch = bpInt;
-                acc.eurcSnapshotAtBatch = eurcInt;
-                unchecked {
-                    ++i;
-                }
+    /// @dev `realAssets` is the sum of:
+    /// (A) idle EURC on the adapter,
+    /// (B) convertToAssets(bpEUR balance on the adapter),
+    /// (C) the value of every live position (see `EurVaultPosition.value()`): real holdings once its
+    ///     batch closed, the stored pending amount before that.
+    /// @dev The adapter itself is never the owner or receiver of an EUR-vault request (positions contracts are)
+    /// @dev Known transient imprecision (upward only, self-clearing at batch close): see
+    ///      `EurVaultPosition.value()`. The parent vault's maxRate cap smooths the upward direction.
+    function _realAssets() internal view returns (uint256 total) {
+        total = IERC20(asset).balanceOf(address(this));
+
+        uint256 shares = IERC20(eurVault).balanceOf(address(this));
+        if (shares != 0) total += IByzantinePrimeEURVault(eurVault).convertToAssets(shares);
+
+        uint256 length = positions.length;
+        for (uint256 i; i < length;) {
+            total += IEurVaultPosition(positions[i]).value();
+            unchecked {
+                ++i;
             }
         }
     }
