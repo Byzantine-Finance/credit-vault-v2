@@ -4,6 +4,7 @@
 pragma solidity ^0.8.0;
 
 import "./ByzantineEurVaultIntegrationTest.sol";
+import {IEurVaultPosition} from "../../src/adapters/interfaces/IEurVaultPosition.sol";
 
 contract ByzantineEurVaultIntegrationDepositTest is ByzantineEurVaultIntegrationTest {
     /// @dev 100 EURC (6 decimals). Used by the fixed-amount tests for clean arithmetic.
@@ -38,6 +39,41 @@ contract ByzantineEurVaultIntegrationDepositTest is ByzantineEurVaultIntegration
         vm.expectRevert(MockByzantinePrimeEURVault.ZeroAssets.selector);
         vm.prank(adapterCurator);
         adapter.requestDeposit(0);
+    }
+
+    /// @notice `EurVaultPosition.initDeposit` is adapter-gated: a direct call from any non-adapter
+    ///         address reverts with `NotAdapter`.
+    function testInitDepositOnlyAdapter(address caller, uint256 assets) public {
+        vm.assume(caller != address(adapter));
+        assets = bound(assets, 1, MAX_TEST_ASSETS);
+
+        // Open a real deposit position through the adapter so we have a live clone to poke at.
+        deal(address(eurc), address(adapter), ASSETS_100);
+        vm.prank(adapterCurator);
+        adapter.requestDeposit(ASSETS_100);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+
+        // The `msg.sender == adapter` guard is checked first, so any non-adapter caller is rejected.
+        vm.expectRevert(IEurVaultPosition.NotAdapter.selector);
+        vm.prank(caller);
+        position.initDeposit(assets);
+    }
+
+    /// @notice A position opens exactly ONE ticket in its lifetime: re-initializing an
+    ///         already-initialized deposit position reverts with `AlreadyInitialized` — even when the
+    ///         caller is the adapter itself (the `batchId == 0` guard, not the sender check, blocks it).
+    function testInitDepositCannotReinitialize() public {
+        // Open a deposit position; `batchId` is now set, so the clone counts as initialized.
+        deal(address(eurc), address(adapter), ASSETS_100);
+        vm.prank(adapterCurator);
+        adapter.requestDeposit(ASSETS_100);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertGt(position.batchId(), 0, "position must be initialized (batchId set)");
+
+        // Pass the `NotAdapter` guard by impersonating the adapter, then trip `AlreadyInitialized`.
+        vm.expectRevert(IEurVaultPosition.AlreadyInitialized.selector);
+        vm.prank(address(adapter));
+        position.initDeposit(ASSETS_100);
     }
 
     /* ------------------------------------------------------------------ */

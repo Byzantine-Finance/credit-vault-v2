@@ -633,4 +633,157 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
             "phase 4: closeBatch removed EXACTLY the residue (mid-DNT minus post-close)"
         );
     }
+
+    /* ------------------------------------------------------------------ */
+    /*  Swap-fee + withdraw-fee residue during partial finalize           */
+    /*  (withdraw side, m=1 only)                                         */
+    /* ------------------------------------------------------------------ */
+    //
+    // `EurVaultPosition.value()` NatSpec documents the same transient over-statement for a withdraw
+    // ticket, but bounded by BOTH fees composed in the mock's settlement order (matching the real vault):
+    //   1. hedge swap fee — flat haircut on the gross PPS-derived `owed`
+    //   2. protocol withdraw fee — applied on the post-swap amount
+    //
+    //   residue = (owed - afterSwap) + withdrawFee
+    //           = ceil(owed × swapFeeBps / 10_000) + ceil(afterSwap × withdrawFeeBps / 10_000)
+
+    /// @notice Withdraw-side fee residue: between `processWithdrawChunk` and `closeBatch`,
+    ///         `realAssets()` reports the PRE-haircut pending amount even though the on-chain swap loss
+    ///         and withdraw fee have already been realized off the position's EURC payout. `closeBatch` resolves it.
+    ///
+    /// @dev    Full-seed withdraw (W = all seeded shares), so the adapter retains no bpEUR/EURC and the
+    ///         position is the ONLY source of value — isolating the residue.
+    ///         Walk-through (x_s = swapFeeBps/10_000, x_w = withdrawFeeBps/10_000):
+    ///           0) seed + requestWithdraw(W) opens a withdraw position with pendingShares = W.
+    ///           1) executeDnt locks the snapshot. realAssets still = owed (gross, PPS 1.0).
+    ///           2) processWithdrawChunk pays `toPay = floor(owed·(1-x_s)) - ceil(afterSwap·x_w)` to the
+    ///              position, but it is still valued at convertToAssets(W) = owed (close-based).
+    ///           3) Before close, realAssets over-states by `owed - toPay`.
+    ///           4) closeBatch flips the position to settled: realAssets = toPay (exact, no residue).
+    function testSwapFeeResidueOnWithdrawChunkVanishesAtClose(
+        uint256 seedEurc,
+        uint16 swapFeeBps,
+        uint16 withdrawFeeBps
+    ) public {
+        swapFeeBps = uint16(bound(uint256(swapFeeBps), 1, 1_000)); // [1bps, 10%]
+        withdrawFeeBps = uint16(bound(uint256(withdrawFeeBps), 1, 1_000)); // [1bps, 10%]
+        seedEurc = bound(seedEurc, 1e6, 100e6); // [1, 100] EURC
+
+        // ---- Phase 0: seed the adapter with `seedEurc` worth of bpEUR (gate-open, PPS 1.0) ----
+        // Fees are still zero here, so the seed deposit mints shares 1:1 and is itself unaffected.
+        vault.deposit(seedEurc, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", seedEurc);
+        _settleAndSweep();
+
+        uint256 seedShares = IERC20(address(eurVault)).balanceOf(address(adapter));
+        assertEq(seedShares, seedEurc * BPEUR_PER_EURC, "phase 0: seeded shares at PPS 1.0");
+
+        // Turn the fees on AFTER seeding so only the withdraw settlement pays them.
+        eurVault.setHedgeSwapFeeBps(swapFeeBps);
+        eurVault.setWithdrawFeeBps(withdrawFeeBps);
+
+        // ---- Phase 1: requestWithdraw(W) burns ALL the adapter's bpEUR into a withdraw position ----
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(seedShares);
+        address position = adapter.positions(0);
+        assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "phase 1: adapter fully burned");
+        // Pre-DNT: the pending withdraw is valued at the live PPS (= 1.0); no fee applied yet.
+        assertEq(adapter.realAssets(), seedEurc, "phase 1: pre-DNT realAssets = seed (gross, no fee yet)");
+
+        // ---- Phase 2: executeDnt locks the NAV/supply snapshot ----
+        eurVault.executeDnt();
+        assertEq(adapter.realAssets(), seedEurc, "phase 2: realAssets unchanged at DNT entry");
+
+        // Pre-compute `toPay`, mirroring `processWithdrawChunk`'s fee order. The full withdraw at
+        // snapshot PPS 1.0 makes `owed == seedEurc` exactly (W·nav/supply with nav==seed, supply==W).
+        uint256 owed = seedEurc;
+        uint256 afterSwap = owed.mulDivDown(10_000 - uint256(swapFeeBps), 10_000); // swap haircut (floor)
+        uint256 withdrawFee = afterSwap.mulDivUp(uint256(withdrawFeeBps), 10_000); // protocol fee (ceil)
+        uint256 toPay = afterSwap - withdrawFee;
+        uint256 expectedResidue = owed - toPay;
+
+        // The residue decomposes into (swap loss + withdraw fee).
+        // Identity: owed - floor(owed·(1-x_s)) == ceil(owed·x_s).
+        uint256 swapLoss = owed.mulDivUp(uint256(swapFeeBps), 10_000);
+        assertEq(expectedResidue, swapLoss + withdrawFee, "residue == ceil(owed*swap) + ceil(afterSwap*withdraw)");
+
+        // ---- Phase 3: silent withdraw chunk — EURC paid to the position, post BOTH fees ----
+        address[] memory receivers = new address[](1);
+        receivers[0] = position;
+        eurVault.processWithdrawChunk(receivers, type(uint256).max);
+        assertEq(eurc.balanceOf(position), toPay, "phase 3: position paid `toPay` (both fees realized)");
+
+        // ---- Phase 3 checks: load-bearing assertions on the mid-DNT residue ----
+        uint256 realAssetsMidDnt = adapter.realAssets();
+
+        // (a) realAssets STILL reports the gross `owed` — the burned shares are valued at the snapshot
+        //     PPS until the batch closes (close-based valuation), ignoring the realized fees.
+        assertEq(realAssetsMidDnt, owed, "phase 3: realAssets over-states (= gross owed)");
+
+        // (b) The over-state is strictly positive (both fees > 0).
+        assertGt(realAssetsMidDnt - toPay, 0, "phase 3: residue strictly positive when fees > 0");
+
+        // (c) The over-state equals the EXACT residue the mock realized off the payout.
+        assertEq(realAssetsMidDnt - toPay, expectedResidue, "phase 3: residue == owed - toPay");
+
+        // (d) Documented combined-fee bound holds: residue <= ceil(owed·swap) + ceil(afterSwap·withdraw).
+        uint256 residueMax =
+            owed.mulDivUp(uint256(swapFeeBps), 10_000) + afterSwap.mulDivUp(uint256(withdrawFeeBps), 10_000);
+        assertLe(realAssetsMidDnt - toPay, residueMax, "phase 3: residue lte documented combined-fee bound");
+
+        // ---- Phase 4: closeBatch — the position settles, residue DISAPPEARS ----
+        eurVault.closeBatch();
+        uint256 realAssetsPostClose = adapter.realAssets();
+
+        // The settled position is now valued by its real EURC holding only (the swept-able payout).
+        assertEq(realAssetsPostClose, toPay, "phase 4: post-close realAssets = toPay (exact, no residue)");
+        // The delta IS the residue — proof that closeBatch was the event that removed it.
+        assertEq(
+            realAssetsMidDnt - realAssetsPostClose,
+            expectedResidue,
+            "phase 4: closeBatch removed EXACTLY the residue (mid-DNT minus post-close)"
+        );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Loss scenario: PPS < 1.0 passes through immediately (downward)    */
+    /* ------------------------------------------------------------------ */
+
+    /// @notice A loss in the EUR vault (PPS < 1.0) must pass through `realAssets()` IMMEDIATELY and in the
+    ///         DOWNWARD direction — for bpEUR held directly by the adapter (branch B) and for a pending
+    ///         withdraw position valued via `convertToAssets(pendingShares)`. Unlike the upward donation /
+    ///         swap-fee-residue cases, a loss is NOT smoothed or capped: it is reflected at once. This is
+    ///         exactly the "phantom loss" direction the `value()` NatSpec calls out — an under-statement
+    ///         passes straight through, so the valuation must track the live (loss-adjusted) PPS.
+    function testRealAssetsReflectsLoss(uint256 seedEurc, uint256 lossEurc) public {
+        seedEurc = bound(seedEurc, 2e6, 100e6); // [2, 100] EURC
+        lossEurc = bound(lossEurc, 1e6, seedEurc - 1e6); // strict partial loss: 0 < loss < seed
+
+        // Seed the adapter with `seedEurc` worth of bpEUR at PPS 1.0.
+        vault.deposit(seedEurc, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", seedEurc);
+        _settleAndSweep();
+
+        uint256 seedShares = IERC20(address(eurVault)).balanceOf(address(adapter));
+        assertEq(adapter.realAssets(), seedEurc, "pre-loss realAssets == seed (PPS 1.0)");
+
+        // Apply the loss: backing drops from `seedEurc` to `seedEurc - lossEurc`, so PPS < 1.0.
+        eurVault.setShareRate(-int256(lossEurc));
+        uint256 expected = seedEurc - lossEurc;
+
+        // Branch B (adapter's idle bpEUR) tracks the reduced PPS immediately — no smoothing on the way down.
+        assertEq(adapter.realAssets(), expected, "loss passes through realAssets immediately (branch B)");
+        assertLt(adapter.realAssets(), seedEurc, "loss is reflected downward, not smoothed");
+
+        // The same loss must flow through a PENDING WITHDRAW position: burning the shares moves their
+        // value to the position, still priced at the live (loss-adjusted) PPS via convertToAssets.
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(seedShares);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertEq(position.pendingShares(), seedShares, "pending withdraw holds the burned shares");
+        assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "adapter bpEUR fully burned");
+        assertEq(adapter.realAssets(), expected, "pending withdraw reflects the loss at live PPS");
+    }
 }

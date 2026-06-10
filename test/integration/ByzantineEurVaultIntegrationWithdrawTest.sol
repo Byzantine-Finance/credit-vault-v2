@@ -5,6 +5,7 @@ pragma solidity ^0.8.0;
 
 import "./ByzantineEurVaultIntegrationTest.sol";
 import {ByzantineEurVaultAdapter} from "../../src/adapters/ByzantineEurVaultAdapter.sol";
+import {IEurVaultPosition} from "../../src/adapters/interfaces/IEurVaultPosition.sol";
 
 contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegrationTest {
     /* requestWithdraw ACCESS CONTROL */
@@ -28,6 +29,44 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         vm.prank(adapterCurator);
         vm.expectRevert(IByzantineEurVaultAdapter.InsufficientShares.selector);
         adapter.requestWithdraw(shares);
+    }
+
+    function testInitWithdrawOnlyAdapter(address caller, uint256 shares) public {
+        vm.assume(caller != address(adapter));
+        shares = bound(shares, 1, type(uint128).max);
+
+        // Open a real withdraw position through the adapter so we have a live clone to poke at.
+        vault.deposit(100e6, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", 100e6);
+        _settleAndSweep();
+        uint256 heldShares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(heldShares);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+
+        // The `msg.sender == adapter` guard is checked first, so any non-adapter caller is rejected.
+        vm.expectRevert(IEurVaultPosition.NotAdapter.selector);
+        vm.prank(caller);
+        position.initWithdraw(shares);
+    }
+
+    function testInitWithdrawCannotReinitialize() public {
+        // Open a withdraw position; `batchId` is now set, so the clone counts as initialized.
+        vault.deposit(100e6, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", 100e6);
+        _settleAndSweep();
+        uint256 heldShares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(heldShares);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertGt(position.batchId(), 0, "position must be initialized (batchId set)");
+
+        // Pass the `NotAdapter` guard by impersonating the adapter, then trip `AlreadyInitialized`.
+        vm.expectRevert(IEurVaultPosition.AlreadyInitialized.selector);
+        vm.prank(address(adapter));
+        position.initWithdraw(1);
     }
 
     /* setAdapterCurator ACCESS CONTROL & STATE */
@@ -367,5 +406,42 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         assertEq(eurVault.claimableEurc(position), 0, "claimable drained");
         assertEq(adapter.positionsLength(), 0, "settled position dropped");
         assertEq(adapter.realAssets(), assets, "realAssets reflects the swept idle EURC");
+    }
+
+    /* sweep GUARDS (position clone) */
+
+    /// @notice `EurVaultPosition.sweep` is adapter-gated: a direct call from any non-adapter address
+    ///         reverts with `NotAdapter`. Only the adapter may pull a position's proceeds home — a third
+    ///         party cannot redirect a clone's claim/transfer logic.
+    function testSweepOnlyAdapter(address caller) public {
+        vm.assume(caller != address(adapter));
+
+        // Open a position through the adapter so we have a live clone to poke at.
+        vault.deposit(100e6, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", 100e6);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+
+        // The `msg.sender == adapter` guard is checked first, so any non-adapter caller is rejected.
+        vm.expectRevert(IEurVaultPosition.NotAdapter.selector);
+        vm.prank(caller);
+        position.sweep();
+    }
+
+    /// @notice `sweep` requires the position's batch to have closed: sweeping a still-pending position
+    ///         reverts with `NotSettled` — even when the caller is the adapter itself. This is what stops
+    ///         proceeds from being pulled home before settlement has actually credited them.
+    function testSweepRevertsWhenNotSettled() public {
+        // Open a deposit position but do NOT settle: its batch is still open, so settled() == false.
+        vault.deposit(100e6, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", 100e6);
+        EurVaultPosition position = EurVaultPosition(adapter.positions(0));
+        assertFalse(position.settled(), "position must still be pending");
+
+        // Pass the `NotAdapter` guard by impersonating the adapter, then trip `NotSettled`.
+        vm.expectRevert(IEurVaultPosition.NotSettled.selector);
+        vm.prank(address(adapter));
+        position.sweep();
     }
 }
