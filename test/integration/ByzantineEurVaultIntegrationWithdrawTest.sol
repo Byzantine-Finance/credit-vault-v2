@@ -250,6 +250,38 @@ contract ByzantineEurVaultIntegrationWithdrawTest is ByzantineEurVaultIntegratio
         assertEq(eurVault.totalEurcBacking(), 0, "backing fully drained by gross owed");
     }
 
+    /// @notice A pending withdraw is valued NET of the protocol withdraw fee from the moment of the
+    ///         request (`previewRedeemNetAssets`, live fee read): the certain fee cost is recognized
+    ///         when the shares are burned, not at batch close — so no over-stated window exists for
+    ///         the deterministic fee component (Sherlock issue #8).
+    function testPendingWithdrawValuedNetOfWithdrawFee(uint256 assets, uint16 feeBps) public {
+        feeBps = uint16(bound(feeBps, 1, 1_000)); // up to 10%
+        assets = bound(assets, MIN_TEST_ASSETS, MAX_TEST_ASSETS);
+        eurVault.setWithdrawFeeBps(feeBps);
+
+        // Seed the adapter with bpEUR (deposit side unaffected by the withdraw fee).
+        vault.deposit(assets, address(this));
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", assets);
+        _settleAndSweep();
+        assertEq(adapter.realAssets(), assets, "pre-request: gross value (no withdrawal committed)");
+
+        uint256 shares = eurVault.balanceOf(address(adapter));
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+
+        uint256 expectedFee = (assets * feeBps + 9_999) / 10_000;
+        uint256 expectedNet = assets - expectedFee;
+
+        // The fee is recognized immediately at request time...
+        assertEq(adapter.realAssets(), expectedNet, "pending withdraw valued net of the protocol fee");
+
+        // ...and the valuation stays exact through settlement and sweep (no step at close).
+        _settleAndSweep();
+        assertEq(eurc.balanceOf(address(adapter)), expectedNet, "actual payout matches the pending valuation");
+        assertEq(adapter.realAssets(), expectedNet, "realAssets consistent after settlement");
+    }
+
     /// @notice Scenario 2: Hedge swap fee only: Adapter receives `gross * (1 - swapFeeBps/10000)` EURC at settlement.
     ///         The swap-loss EURC stays on the EUR vault contract balance.
     function testSwapFeeHaircutsWithdrawPayout(uint256 assets, uint16 swapFeeBps) public {

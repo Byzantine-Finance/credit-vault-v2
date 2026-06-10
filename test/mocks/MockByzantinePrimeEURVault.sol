@@ -177,6 +177,15 @@ contract MockByzantinePrimeEURVault is ERC20, IByzantinePrimeEURVault {
         return (assets * supply) / nav;
     }
 
+    /// @dev Mirrors the real vault: `convertToAssets` minus the protocol withdraw fee (ceil),
+    ///      reading the CURRENT `withdrawFeeBps`. Does not include swap fee / budget haircuts.
+    function previewRedeemNetAssets(uint256 shares) external view override returns (uint256) {
+        if (shares == 0) return 0;
+        uint256 grossAssets = convertToAssets(shares);
+        uint256 fee = _withdrawFeeBps == 0 ? 0 : _mulDivUp(grossAssets, _withdrawFeeBps, 10_000);
+        return grossAssets - fee;
+    }
+
     /* EXTERNAL FUNCTIONS */
 
     /// @dev pulls `assets` of EURC, applies the deposit fee (mulDivUp), queues net for the active batch.

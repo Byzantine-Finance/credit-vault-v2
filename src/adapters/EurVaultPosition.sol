@@ -90,7 +90,8 @@ contract EurVaultPosition is IEurVaultPosition {
     ///        any gate-blocked claimables, with bpEUR priced at the current PPS.
     ///
     ///      - Pending (batch not closed, including mid-DNT): the stored request amount —
-    ///        `pendingEurc` for a deposit, `convertToAssets(pendingShares)` for a withdraw.
+    ///        `pendingEurc` for a deposit, `previewRedeemNetAssets(pendingShares)` for a withdraw
+    ///        (net of the protocol withdraw fee, read live so governance fee changes are tracked).
     ///
     ///      Donation safety: in pending mode no balance is read, so sending tokens to the clone
     ///      cannot alter its valuation; in settled mode a donation can only push the value UP,
@@ -104,7 +105,7 @@ contract EurVaultPosition is IEurVaultPosition {
     ///      For a deposit the over-statement is bounded by
     ///        (hedgeSwapFeeBps / 10_000) × (dntDepositEurcNet / dntDepositsEurc) × pendingEurc
     ///
-    ///      For a withdraw same equation but: hedgeSwapFeeBps + withdrawFeeBps
+    ///      For a withdraw same logic.
     ///
     ///      The over-statement disappears at batch close.
     ///      The error direction is deliberate: the parent vault's maxRate cap smooths upward moves
@@ -132,7 +133,7 @@ contract EurVaultPosition is IEurVaultPosition {
         }
 
         uint256 pendingShares_ = pendingShares;
-        return pendingShares_ != 0 ? v.convertToAssets(pendingShares_) : pendingEurc;
+        return pendingShares_ != 0 ? v.previewRedeemNetAssets(pendingShares_) : pendingEurc;
     }
 
     /* SWEEP (adapter only, after settlement) */

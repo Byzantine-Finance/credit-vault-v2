@@ -762,25 +762,26 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
     /* ------------------------------------------------------------------ */
     //
     // `EurVaultPosition.value()` NatSpec documents the same transient over-statement for a withdraw
-    // ticket, but bounded by BOTH fees composed in the mock's settlement order (matching the real vault):
-    //   1. hedge swap fee — flat haircut on the gross PPS-derived `owed`
-    //   2. protocol withdraw fee — applied on the post-swap amount
+    // ticket. The protocol withdraw fee is already deducted live (`previewRedeemNetAssets`), so the
+    // remaining residue is the swap-fee component only (plus the gross-vs-post-swap fee-base rounding):
     //
-    //   residue = (owed - afterSwap) + withdrawFee
-    //           = ceil(owed × swapFeeBps / 10_000) + ceil(afterSwap × withdrawFeeBps / 10_000)
+    //   pendingNet = owed - ceil(owed × withdrawFeeBps / 10_000)        // what realAssets reports
+    //   toPay      = afterSwap - ceil(afterSwap × withdrawFeeBps / 10_000)
+    //   residue    = pendingNet - toPay  <=  ceil(owed × swapFeeBps / 10_000)
 
     /// @notice Withdraw-side fee residue: between `processWithdrawChunk` and `closeBatch`,
-    ///         `realAssets()` reports the PRE-haircut pending amount even though the on-chain swap loss
-    ///         and withdraw fee have already been realized off the position's EURC payout. `closeBatch` resolves it.
+    ///         `realAssets()` reports the pending amount net of the protocol fee but still GROSS of
+    ///         the swap haircut (only realized at settlement). `closeBatch` resolves it.
     ///
     /// @dev    Full-seed withdraw (W = all seeded shares), so the adapter retains no bpEUR/EURC and the
     ///         position is the ONLY source of value — isolating the residue.
     ///         Walk-through (x_s = swapFeeBps/10_000, x_w = withdrawFeeBps/10_000):
     ///           0) seed + requestWithdraw(W) opens a withdraw position with pendingShares = W.
-    ///           1) executeDnt locks the snapshot. realAssets still = owed (gross, PPS 1.0).
+    ///              The protocol fee is recognized HERE: realAssets = owed - ceil(owed·x_w).
+    ///           1) executeDnt locks the snapshot. realAssets unchanged (= pendingNet).
     ///           2) processWithdrawChunk pays `toPay = floor(owed·(1-x_s)) - ceil(afterSwap·x_w)` to the
-    ///              position, but it is still valued at convertToAssets(W) = owed (close-based).
-    ///           3) Before close, realAssets over-states by `owed - toPay`.
+    ///              position, but it is still valued at pendingNet (close-based).
+    ///           3) Before close, realAssets over-states by `pendingNet - toPay` (swap component only).
     ///           4) closeBatch flips the position to settled: realAssets = toPay (exact, no residue).
     function testSwapFeeResidueOnWithdrawChunkVanishesAtClose(
         uint256 seedEurc,
@@ -810,25 +811,27 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         adapter.requestWithdraw(seedShares);
         address position = adapter.positions(0);
         assertEq(IERC20(address(eurVault)).balanceOf(address(adapter)), 0, "phase 1: adapter fully burned");
-        // Pre-DNT: the pending withdraw is valued at the live PPS (= 1.0); no fee applied yet.
-        assertEq(adapter.realAssets(), seedEurc, "phase 1: pre-DNT realAssets = seed (gross, no fee yet)");
+        // Pre-DNT: the pending withdraw is valued at the live PPS (= 1.0), NET of the protocol fee
+        // (recognized at request via previewRedeemNetAssets). The swap haircut is not known yet.
+        uint256 owed = seedEurc;
+        uint256 pendingNet = owed - owed.mulDivUp(uint256(withdrawFeeBps), 10_000);
+        assertEq(adapter.realAssets(), pendingNet, "phase 1: pre-DNT realAssets = owed net of protocol fee");
 
         // ---- Phase 2: executeDnt locks the NAV/supply snapshot ----
         eurVault.executeDnt();
-        assertEq(adapter.realAssets(), seedEurc, "phase 2: realAssets unchanged at DNT entry");
+        assertEq(adapter.realAssets(), pendingNet, "phase 2: realAssets unchanged at DNT entry");
 
         // Pre-compute `toPay`, mirroring `processWithdrawChunk`'s fee order. The full withdraw at
         // snapshot PPS 1.0 makes `owed == seedEurc` exactly (W·nav/supply with nav==seed, supply==W).
-        uint256 owed = seedEurc;
         uint256 afterSwap = owed.mulDivDown(10_000 - uint256(swapFeeBps), 10_000); // swap haircut (floor)
         uint256 withdrawFee = afterSwap.mulDivUp(uint256(withdrawFeeBps), 10_000); // protocol fee (ceil)
         uint256 toPay = afterSwap - withdrawFee;
-        uint256 expectedResidue = owed - toPay;
+        uint256 expectedResidue = pendingNet - toPay;
 
-        // The residue decomposes into (swap loss + withdraw fee).
+        // The residue is now the swap component only: bounded by ceil(owed·x_s).
         // Identity: owed - floor(owed·(1-x_s)) == ceil(owed·x_s).
         uint256 swapLoss = owed.mulDivUp(uint256(swapFeeBps), 10_000);
-        assertEq(expectedResidue, swapLoss + withdrawFee, "residue == ceil(owed*swap) + ceil(afterSwap*withdraw)");
+        assertLe(expectedResidue, swapLoss, "residue <= ceil(owed*swap) (protocol fee pre-deducted)");
 
         // ---- Phase 3: silent withdraw chunk — EURC paid to the position, post BOTH fees ----
         address[] memory receivers = new address[](1);
@@ -839,20 +842,18 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         // ---- Phase 3 checks: load-bearing assertions on the mid-DNT residue ----
         uint256 realAssetsMidDnt = adapter.realAssets();
 
-        // (a) realAssets STILL reports the gross `owed` — the burned shares are valued at the snapshot
-        //     PPS until the batch closes (close-based valuation), ignoring the realized fees.
-        assertEq(realAssetsMidDnt, owed, "phase 3: realAssets over-states (= gross owed)");
+        // (a) realAssets STILL reports `pendingNet` — the burned shares are valued at the snapshot
+        //     PPS net of the protocol fee until the batch closes, ignoring the realized swap loss.
+        assertEq(realAssetsMidDnt, pendingNet, "phase 3: realAssets over-states (= pendingNet)");
 
-        // (b) The over-state is strictly positive (both fees > 0).
-        assertGt(realAssetsMidDnt - toPay, 0, "phase 3: residue strictly positive when fees > 0");
+        // (b) The over-state is strictly positive (swap fee > 0).
+        assertGt(realAssetsMidDnt - toPay, 0, "phase 3: residue strictly positive when swap fee > 0");
 
         // (c) The over-state equals the EXACT residue the mock realized off the payout.
-        assertEq(realAssetsMidDnt - toPay, expectedResidue, "phase 3: residue == owed - toPay");
+        assertEq(realAssetsMidDnt - toPay, expectedResidue, "phase 3: residue == pendingNet - toPay");
 
-        // (d) Documented combined-fee bound holds: residue <= ceil(owed·swap) + ceil(afterSwap·withdraw).
-        uint256 residueMax =
-            owed.mulDivUp(uint256(swapFeeBps), 10_000) + afterSwap.mulDivUp(uint256(withdrawFeeBps), 10_000);
-        assertLe(realAssetsMidDnt - toPay, residueMax, "phase 3: residue lte documented combined-fee bound");
+        // (d) Documented bound holds: the residue is the swap component only.
+        assertLe(realAssetsMidDnt - toPay, swapLoss, "phase 3: residue lte documented swap-fee bound");
 
         // ---- Phase 4: closeBatch — the position settles, residue DISAPPEARS ----
         eurVault.closeBatch();
