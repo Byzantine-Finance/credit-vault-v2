@@ -52,11 +52,11 @@ contract EurVaultPosition is IEurVaultPosition {
     function initDeposit(uint256 assets) external returns (uint256 batchId_, uint256 netAssets) {
         require(msg.sender == adapter, NotAdapter());
         require(batchId == 0, AlreadyInitialized());
+        batchId_ = _activeBatchId();
 
         SafeERC20Lib.safeApprove(asset, eurVault, assets);
         IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
 
-        batchId_ = _activeBatchId();
         netAssets = _netAssetsAfterDepositFee(assets);
         batchId = batchId_;
         pendingEurc = netAssets;
@@ -68,10 +68,10 @@ contract EurVaultPosition is IEurVaultPosition {
     function initWithdraw(uint256 shares) external returns (uint256 batchId_) {
         require(msg.sender == adapter, NotAdapter());
         require(batchId == 0, AlreadyInitialized());
+        batchId_ = _activeBatchId();
 
         IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
 
-        batchId_ = _activeBatchId();
         batchId = batchId_;
         pendingShares = shares;
     }
