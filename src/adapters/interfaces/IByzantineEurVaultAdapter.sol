@@ -40,6 +40,8 @@ interface IByzantineEurVaultAdapter is IAdapter {
     function positionNonce() external view returns (uint256);
     function positions(uint256 index) external view returns (address);
     function positionsLength() external view returns (uint256);
+    function depositPositionOf(uint256 batchId) external view returns (address);
+    function withdrawPositionOf(uint256 batchId) external view returns (address);
     function ids() external view returns (bytes32[] memory);
     function allocation() external view returns (uint256);
     function realAssets() external view returns (uint256);

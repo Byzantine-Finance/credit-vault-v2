@@ -76,6 +76,32 @@ contract EurVaultPosition is IEurVaultPosition {
         pendingShares = shares;
     }
 
+    /// @dev Appends another deposit ticket to this position's batch. Used when several deposits land in
+    ///      the same EUR-vault batch.
+    ///      The `BatchMismatch` guard (active batch must still equal this position's batch) also rejects
+    ///      calls on an uninitialized position, since real batch ids start at 1.
+    /// @return netAssets `assets` net of the EUR vault's deposit fee, added to `pendingEurc`.
+    function addDeposit(uint256 assets) external returns (uint256 netAssets) {
+        require(msg.sender == adapter, NotAdapter());
+        require(_activeBatchId() == batchId, BatchMismatch());
+
+        netAssets = _netAssetsAfterDepositFee(assets);
+        pendingEurc += netAssets;
+
+        SafeERC20Lib.safeApprove(asset, eurVault, assets);
+        IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
+    }
+
+    /// @dev Appends another withdraw ticket to this position's batch (see `addDeposit`).
+    function addWithdraw(uint256 shares) external {
+        require(msg.sender == adapter, NotAdapter());
+        require(_activeBatchId() == batchId, BatchMismatch());
+
+        pendingShares += shares;
+
+        IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
+    }
+
     /* VIEWS */
 
     /// @dev True once the EUR vault has closed this position's batch
