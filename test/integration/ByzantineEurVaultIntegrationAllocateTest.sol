@@ -57,7 +57,7 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         assertEq(adapter.allocation(), adapter.realAssets(), "parent vault allocation matches realAssets");
     }
 
-    function testAllocateMultipleTimesSameBatchCreatesSeparatePositions(uint256 a1, uint256 a2) public {
+    function testAllocateMultipleTimesSameBatchAggregatesIntoOnePosition(uint256 a1, uint256 a2) public {
         a1 = bound(a1, MIN_TEST_ASSETS, MAX_TEST_ASSETS / 2);
         a2 = bound(a2, MIN_TEST_ASSETS, MAX_TEST_ASSETS / 2);
 
@@ -70,14 +70,14 @@ contract ByzantineEurVaultIntegrationAllocateTest is ByzantineEurVaultIntegratio
         vault.allocate(address(adapter), hex"", a2);
         vm.stopPrank();
 
-        // One position per request, both queued on the same batch (no settlement in between).
-        assertEq(adapter.positionsLength(), 2, "one position per allocate");
-        EurVaultPosition p1 = EurVaultPosition(adapter.positions(0));
-        EurVaultPosition p2 = EurVaultPosition(adapter.positions(1));
-        assertEq(p1.batchId(), batchId, "p1 batch");
-        assertEq(p2.batchId(), batchId, "p2 batch");
-        assertEq(p1.pendingEurc() + p2.pendingEurc(), a1 + a2, "pending amounts sum");
-        assertEq(adapter.realAssets(), a1 + a2, "realAssets sums both positions");
+        // Same batch (no settlement in between): both deposits aggregate into a single position,
+        // so the live-position count stays bounded by the number of open batches.
+        assertEq(adapter.positionsLength(), 1, "one position per batch");
+        EurVaultPosition p = EurVaultPosition(adapter.positions(0));
+        assertEq(p.batchId(), batchId, "position batch");
+        assertEq(adapter.depositPositionOf(batchId), address(p), "batch maps to the position");
+        assertEq(p.pendingEurc(), a1 + a2, "pending amounts accumulate on the single position");
+        assertEq(adapter.realAssets(), a1 + a2, "realAssets sums both allocates");
     }
 
     function testAllocateAcrossDifferentBatchesUsesNextBatchId(uint256 a1, uint256 a2) public {

@@ -79,12 +79,21 @@ contract ByzantineEurVaultIntegrationBatchTest is ByzantineEurVaultIntegrationTe
     /// @notice `maxPositions` bounds the sweep so it cannot run out of gas; remaining settled
     ///         positions are swept by subsequent calls.
     function testSweepSettledBoundedByMaxPositions() public {
+        // Seed the adapter with bpEUR so it can also open a withdraw position.
         vault.deposit(ASSETS_100 + ASSETS_250, address(this));
-        vm.startPrank(allocator);
+        vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
+        _settleAndSweep();
+        uint256 shares = IERC20(address(eurVault)).balanceOf(address(adapter));
+
+        // Two positions in the SAME batch: one deposit, one withdraw (separate position mappings).
+        vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_250);
-        vm.stopPrank();
-        _settleAdapterBatch(); // both positions settle in the same batch
+        vm.prank(adapterCurator);
+        adapter.requestWithdraw(shares);
+        assertEq(adapter.positionsLength(), 2, "deposit + withdraw positions in one batch");
+
+        _settleAdapterBatch(); // both settle in the same batch
         assertEq(adapter.positionsLength(), 2, "two settled positions listed");
 
         adapter.sweepSettled(1);
@@ -92,7 +101,5 @@ contract ByzantineEurVaultIntegrationBatchTest is ByzantineEurVaultIntegrationTe
 
         adapter.sweepSettled(1);
         assertEq(adapter.positionsLength(), 0, "second call sweeps the rest");
-
-        assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "value preserved across bounded sweeps");
     }
 }
