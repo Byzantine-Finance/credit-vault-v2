@@ -101,6 +101,11 @@ contract ByzantineEurVaultIntegrationGateTest is ByzantineEurVaultIntegrationTes
         address position1 = adapter.positions(0);
         assertTrue(gateWhitelist.whitelisted(position1), "position1 on the old gate");
 
+        // Settle + sweep so the next allocate opens a fresh position in a new batch.
+        // (Aggregation into a pre-rotation position would instead need the existing position to be
+        // re-whitelisted on the new gate by the gate owner — see the gate-rotation operational notes.)
+        _settleAndSweep();
+
         // Governance rotates the gates on the EUR vault — nothing is touched on the adapter.
         GateWhitelist newGate = new GateWhitelist(gateOwner);
         address implementation = adapter.positionImplementation();
@@ -108,10 +113,10 @@ contract ByzantineEurVaultIntegrationGateTest is ByzantineEurVaultIntegrationTes
         newGate.setClonerImplementation(address(adapter), implementation);
         eurVault.setGates(address(newGate), address(newGate), address(newGate), address(newGate));
 
-        // Next position is whitelisted on the NEW gate automatically.
+        // A new batch's position is whitelisted on the NEW gate automatically.
         vm.prank(allocator);
         vault.allocate(address(adapter), hex"", ASSETS_100);
-        address position2 = adapter.positions(1);
+        address position2 = adapter.positions(adapter.positionsLength() - 1);
         assertTrue(newGate.whitelisted(position2), "position2 whitelisted on the new gate");
         assertFalse(gateWhitelist.whitelisted(position2), "position2 not on the old gate");
     }

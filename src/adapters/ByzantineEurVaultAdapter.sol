@@ -35,6 +35,12 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
     /// @dev Live positions (not yet swept). Settled ones are swept and removed by `_sweepSettled`.
     address[] public positions;
 
+    /// @dev Open batch id => address of the clone aggregating that batch's deposits.
+    mapping(uint256 batchId => address) public depositPositionOf;
+
+    /// @dev Open batch id => address of the clone aggregating that batch's withdrawals.
+    mapping(uint256 batchId => address) public withdrawPositionOf;
+
     /// @dev CREATE2 salt counter, so position addresses are predictable
     uint256 public positionNonce;
 
@@ -64,7 +70,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         _sweepSettled(type(uint256).max);
 
         if (assets != 0) {
-            (address position, uint256 batchId, uint256 netAssets) = _openDepositPosition(assets);
+            (address position, uint256 batchId, uint256 netAssets) = _routeDeposit(assets);
             emit Allocate(position, batchId, assets, netAssets);
         }
 
@@ -114,7 +120,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // Only allowed to deposit if the adapter has enough idle EURC
         require(IERC20(asset).balanceOf(address(this)) >= assets, InsufficientIdle());
 
-        (address position, uint256 batchId, uint256 netAssets) = _openDepositPosition(assets);
+        (address position, uint256 batchId, uint256 netAssets) = _routeDeposit(assets);
 
         emit RequestDeposit(position, batchId, assets, netAssets);
     }
@@ -131,10 +137,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         // Only allowed to withdraw shares the adapter actually holds
         require(IERC20(eurVault).balanceOf(address(this)) >= shares, InsufficientShares());
 
-        address position = _createPosition();
-        SafeERC20Lib.safeTransfer(eurVault, position, shares);
-        uint256 batchId = IEurVaultPosition(position).initWithdraw(shares);
-        positions.push(position);
+        (address position, uint256 batchId) = _routeWithdraw(shares);
 
         emit RequestWithdraw(position, batchId, shares);
     }
@@ -231,15 +234,43 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         return false;
     }
 
-    /// @dev Clones a fresh position, funds it with `assets` EURC and opens its deposit ticket.
-    function _openDepositPosition(uint256 assets)
-        internal
-        returns (address position, uint256 batchId, uint256 netAssets)
-    {
-        position = _createPosition();
-        SafeERC20Lib.safeTransfer(asset, position, assets);
-        (batchId, netAssets) = IEurVaultPosition(position).initDeposit(assets);
-        positions.push(position);
+    /// @dev Mirrors the EUR vault's request routing: `currentBatchId` when idle, `nextBatchId` during a DNT.
+    function _activeBatchId() internal view returns (uint256) {
+        IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
+        return v.vaultState() == IByzantinePrimeEURVault.VaultState.NormalIdle ? v.currentBatchId() : v.nextBatchId();
+    }
+
+    /// @dev Routes `assets` into the active batch's deposit position: opens one on first use, otherwise
+    ///      aggregates into the existing one so the live-position count stays bounded by open batches.
+    function _routeDeposit(uint256 assets) internal returns (address position, uint256 batchId, uint256 netAssets) {
+        batchId = _activeBatchId();
+        position = depositPositionOf[batchId];
+        if (position == address(0)) {
+            position = _createPosition();
+            depositPositionOf[batchId] = position;
+            positions.push(position);
+            SafeERC20Lib.safeTransfer(asset, position, assets);
+            (, netAssets) = IEurVaultPosition(position).initDeposit(assets);
+        } else {
+            SafeERC20Lib.safeTransfer(asset, position, assets);
+            netAssets = IEurVaultPosition(position).addDeposit(assets);
+        }
+    }
+
+    /// @dev Withdraw-side mirror of `_routeDeposit`.
+    function _routeWithdraw(uint256 shares) internal returns (address position, uint256 batchId) {
+        batchId = _activeBatchId();
+        position = withdrawPositionOf[batchId];
+        if (position == address(0)) {
+            position = _createPosition();
+            withdrawPositionOf[batchId] = position;
+            positions.push(position);
+            SafeERC20Lib.safeTransfer(eurVault, position, shares);
+            IEurVaultPosition(position).initWithdraw(shares);
+        } else {
+            SafeERC20Lib.safeTransfer(eurVault, position, shares);
+            IEurVaultPosition(position).addWithdraw(shares);
+        }
     }
 
     /// @dev Sweeps up to `maxPositions` settled positions (claims + transfers their proceeds to the
@@ -250,6 +281,11 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         while (i < positions.length && swept < maxPositions) {
             IEurVaultPosition position = IEurVaultPosition(positions[i]);
             if (position.settled()) {
+                // Drop this position's batch->position mapping entry before sweeping it.
+                uint256 bid = position.batchId();
+                if (depositPositionOf[bid] == address(position)) delete depositPositionOf[bid];
+                else if (withdrawPositionOf[bid] == address(position)) delete withdrawPositionOf[bid];
+
                 (uint256 shares, uint256 eurc) = position.sweep();
                 emit SweepPosition(address(position), shares, eurc);
                 // Swap the last element into the current position and pop the last element

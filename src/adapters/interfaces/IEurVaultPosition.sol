@@ -8,6 +8,7 @@ interface IEurVaultPosition {
     error NotAdapter();
     error AlreadyInitialized();
     error NotSettled();
+    error BatchMismatch();
 
     /* VIEWS */
 
@@ -24,5 +25,7 @@ interface IEurVaultPosition {
 
     function initDeposit(uint256 assets) external returns (uint256 batchId_, uint256 netAssets);
     function initWithdraw(uint256 shares) external returns (uint256 batchId_);
+    function addDeposit(uint256 assets) external returns (uint256 netAssets);
+    function addWithdraw(uint256 shares) external;
     function sweep() external returns (uint256 shares, uint256 eurc);
 }

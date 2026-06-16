@@ -144,7 +144,7 @@ contract ByzantineEurVaultRealAssetsTest is ByzantineEurVaultIntegrationTest {
         vault.allocate(address(adapter), hex"", ASSETS_250);
         vm.stopPrank();
 
-        assertEq(adapter.positionsLength(), 2, "one position per allocate");
+        assertEq(adapter.positionsLength(), 1, "one position per batch (both allocates aggregate)");
         assertEq(adapter.realAssets(), ASSETS_100 + ASSETS_250, "realAssets must equal sum of both allocates");
     }
 

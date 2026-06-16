@@ -52,11 +52,11 @@ contract EurVaultPosition is IEurVaultPosition {
     function initDeposit(uint256 assets) external returns (uint256 batchId_, uint256 netAssets) {
         require(msg.sender == adapter, NotAdapter());
         require(batchId == 0, AlreadyInitialized());
+        batchId_ = _activeBatchId();
 
         SafeERC20Lib.safeApprove(asset, eurVault, assets);
         IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
 
-        batchId_ = _activeBatchId();
         netAssets = _netAssetsAfterDepositFee(assets);
         batchId = batchId_;
         pendingEurc = netAssets;
@@ -68,12 +68,38 @@ contract EurVaultPosition is IEurVaultPosition {
     function initWithdraw(uint256 shares) external returns (uint256 batchId_) {
         require(msg.sender == adapter, NotAdapter());
         require(batchId == 0, AlreadyInitialized());
+        batchId_ = _activeBatchId();
 
         IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
 
-        batchId_ = _activeBatchId();
         batchId = batchId_;
         pendingShares = shares;
+    }
+
+    /// @dev Appends another deposit ticket to this position's batch. Used when several deposits land in
+    ///      the same EUR-vault batch.
+    ///      The `BatchMismatch` guard (active batch must still equal this position's batch) also rejects
+    ///      calls on an uninitialized position, since real batch ids start at 1.
+    /// @return netAssets `assets` net of the EUR vault's deposit fee, added to `pendingEurc`.
+    function addDeposit(uint256 assets) external returns (uint256 netAssets) {
+        require(msg.sender == adapter, NotAdapter());
+        require(_activeBatchId() == batchId, BatchMismatch());
+
+        netAssets = _netAssetsAfterDepositFee(assets);
+        pendingEurc += netAssets;
+
+        SafeERC20Lib.safeApprove(asset, eurVault, assets);
+        IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
+    }
+
+    /// @dev Appends another withdraw ticket to this position's batch (see `addDeposit`).
+    function addWithdraw(uint256 shares) external {
+        require(msg.sender == adapter, NotAdapter());
+        require(_activeBatchId() == batchId, BatchMismatch());
+
+        pendingShares += shares;
+
+        IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
     }
 
     /* VIEWS */
@@ -112,17 +138,20 @@ contract EurVaultPosition is IEurVaultPosition {
     ///      of `realAssets()`, whereas an under-statement would pass through immediately as a
     ///      phantom loss.
     ///
-    /// @dev Two more known imprecisions. Like the fees above, both can only OVER-state (never
-    ///      under-state) and both correct themselves when the batch closes:
-    ///      - If the EUR vault does not have enough EURC to pay all of a batch's withdrawals, it
-    ///        pays everyone pro-rata (the "withdrawal budget" haircut). A pending withdraw position
-    ///        is valued at 100% of its shares because this shortfall cannot be known before
-    ///        settlement. The loss only shows up once the batch closes and the position is valued
-    ///        at the EURC it actually received.
-    ///      - During a DNT, `convertToAssets` returns the price frozen for the batch being settled.
-    ///        A withdraw position waiting in the NEXT batch is valued with that frozen price too,
-    ///        while its real payout will use the price of its own, later DNT. The error is at most
-    ///        the price move between two consecutive batches.
+    /// @dev Two more known imprecisions. Both are bounded and both correct themselves when the
+    ///      batch closes, but they differ in direction:
+    ///      - Withdrawal-budget haircut (OVER-statement only, like the fees above). If the EUR
+    ///        vault does not have enough EURC to pay all of a batch's withdrawals, it pays everyone
+    ///        pro-rata. A pending withdraw position is valued at 100% of its shares because this
+    ///        shortfall cannot be known before settlement. The loss only shows up once the batch
+    ///        closes and the position is valued at the EURC it actually received.
+    ///      - Frozen-PPS for a NEXT-batch withdraw (can OVER- OR UNDER-state). During a DNT,
+    ///        `convertToAssets` returns the price frozen for the batch being settled.
+    ///        A withdraw position queued into the NEXT batch is valued with that frozen price too,
+    ///        while its real payout will use the price of its own, later DNT.
+    ///        If the next batch settles at a higher PPS the current valuation temporarily UNDER-states
+    ///        the future payout (and over-states it if the PPS falls). The error is bounded by
+    ///        the price move between two consecutive batches and clears at batch close.
     function value() external view returns (uint256) {
         IByzantinePrimeEURVault v = IByzantinePrimeEURVault(eurVault);
 
