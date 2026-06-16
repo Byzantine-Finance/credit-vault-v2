@@ -107,7 +107,8 @@ contract EurVaultPosition is IEurVaultPosition {
     /// @dev True once the EUR vault has closed this position's batch
     ///      Close-based on purpose: it cannot be forged by donating tokens to this clone.
     function settled() public view returns (bool) {
-        return IByzantinePrimeEURVault(eurVault).currentBatchId() > batchId;
+        uint256 bid = batchId;
+        return bid != 0 && IByzantinePrimeEURVault(eurVault).currentBatchId() > bid;
     }
 
     /// @dev The position's value in EURC terms. Two valuation modes, switched by `settled()`:
