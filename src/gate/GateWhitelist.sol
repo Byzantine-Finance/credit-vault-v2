@@ -4,6 +4,7 @@
 pragma solidity ^0.8.0;
 
 import {IReceiveSharesGate, ISendSharesGate, IReceiveAssetsGate, ISendAssetsGate} from "../../src/interfaces/IGate.sol";
+import {Clones} from "../../lib/openzeppelin-contracts/contracts/proxy/Clones.sol";
 
 /// @notice Morpho Bundler3 contract interface
 /// @dev Must give the address that initiates the transaction to the vault (real msg.sender)
@@ -36,17 +37,20 @@ contract GateWhitelist is IReceiveSharesGate, ISendSharesGate, IReceiveAssetsGat
     address public owner;
     mapping(address => bool) public isBundlerAdapter;
     mapping(address => bool) public whitelisted;
+    mapping(address => address) public clonerImplementation;
 
     /* EVENTS */
 
     event SetOwner(address oldOwner, address indexed newOwner);
     event SetIsWhitelisted(address indexed account, bool newIsWhitelisted);
     event SetIsBundlerAdapter(address indexed account, bool newIsBundlerAdapter);
+    event SetClonerImplementation(address indexed cloner, address indexed implementation);
 
     /* ERRORS */
 
     error Unauthorized();
     error ArrayLengthMismatch();
+    error NotTrustedCloner();
 
     /* CONSTRUCTOR */
 
@@ -84,6 +88,21 @@ contract GateWhitelist is IReceiveSharesGate, ISendSharesGate, IReceiveAssetsGat
         require(msg.sender == owner, Unauthorized());
         isBundlerAdapter[account] = newIsBundlerAdapter;
         emit SetIsBundlerAdapter(account, newIsBundlerAdapter);
+    }
+
+    /// @notice Allow (or revoke with `address(0)`) `cloner` to whitelist EIP-1167 clones of `implementation`.
+    function setClonerImplementation(address cloner, address implementation) external {
+        require(msg.sender == owner, Unauthorized());
+        clonerImplementation[cloner] = implementation;
+        emit SetClonerImplementation(cloner, implementation);
+    }
+
+    /// @notice Sets the whitelist status of the EIP-1167 clone the calling trusted cloner deployed with `salt`.
+    function setIsCloneWhitelisted(bytes32 salt, bool newIsWhitelisted) external returns (address clone) {
+        address implementation = clonerImplementation[msg.sender];
+        require(implementation != address(0), NotTrustedCloner());
+        clone = Clones.predictDeterministicAddress(implementation, salt, msg.sender);
+        _setIsWhitelisted(clone, newIsWhitelisted);
     }
 
     /* VIEW FUNCTIONS */

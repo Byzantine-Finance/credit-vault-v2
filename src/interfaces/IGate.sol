@@ -17,3 +17,8 @@ interface IReceiveAssetsGate {
 interface ISendAssetsGate {
     function canSendAssets(address account) external view returns (bool);
 }
+
+/// @dev Gate extension allowing a trusted cloner to manage the whitelist status of its own EIP-1167 clones.
+interface ICloneWhitelistGate {
+    function setIsCloneWhitelisted(bytes32 salt, bool newIsWhitelisted) external returns (address clone);
+}
