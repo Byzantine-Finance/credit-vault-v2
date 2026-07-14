@@ -9,6 +9,8 @@
 
 `VaultV2` serves ordinary ERC-4626 withdrawals synchronously. Its exit path uses idle EURC first and then asks the configured liquidity adapter to deallocate the shortfall. If the adapter cannot provide enough idle EURC, the transaction reverts.
 
+The July 8 discussion described Aave as the single liquid adapter holding roughly 10% of vault liquidity and the FXH adapter holding roughly 85%. Those percentages and assignments are deployment observations, not source-code defaults. Phase 0 must verify the live configuration before using them for routing or sizing.
+
 `ByzantineEurVaultAdapter` already provides the asynchronous path needed to recover liquidity from the FX hedge vault:
 
 1. its `adapterCurator` calls `requestWithdraw`;
@@ -31,6 +33,22 @@ The first proposed architecture replaced all exits with a new on-chain share esc
 
 The July 8 product discussion described a backend queue rather than a replacement withdrawal protocol. We therefore need the smallest reversible implementation that tests the actual operational assumptions without imposing a hot-path regression.
 
+### Transcript requirement mapping
+
+| Problem or request raised on July 8 | ADR treatment |
+|---|---|
+| A withdrawal larger than Aave/idle liquidity reverts and scares the customer | Intercept only the positively identified simulation failure and return an explicit queued outcome instead of broadcasting a reverting transaction. |
+| Smaller liquid withdrawals should continue immediately | Preserve the existing liquid hot path without new contract calls or queue work. |
+| Store the withdrawal request and customer signature in the database | Persist the exact customer-authorized transaction plus durable queue state; prove delayed validity before acceptance. |
+| Notify the team when a withdrawal queues | Require Telegram operator notification on queue entry and material state/failure transitions; email may be added but is not required for the canary. |
+| Call FXH adapter `requestWithdraw` through `adapterCurator` | Request bounded bpEUR shares through the approved curator custody path. |
+| Wait roughly 24 hours for the async FXH flow | Reconcile actual chain state; treat 24 hours as an expectation, not an SLA. |
+| Return EURC and automatically broadcast the stored customer withdrawal | After the human-authorized protocol steps complete, sweep the position, explicitly deallocate FXH-adapter EURC into `VaultV2` when required, re-simulate, and automatically broadcast the unchanged transaction once. |
+| Complete to either wallet or bank account | Resume the exact receiver/off-ramp path encoded by the original customer transaction; the queue must not substitute a destination. |
+| Consider rebalancing after a large withdrawal | Defer rebalancing to a separate decision. |
+| Propose a solution before implementation | Keep this ADR `Proposed` until the controlled integration evidence and operational decisions are approved. |
+| Store the curator key in application environment configuration | Intentionally rejected: use existing human-authorized custody first; constrained automation requires a separate decision; plaintext production keys are prohibited. |
+
 ## Decision
 
 Start with a **bounded backend-first canary**. Do not modify `VaultV2`, `ByzantineEurVaultAdapter`, `EurVaultPosition`, or `ByzantinePrimeEURVault` for v1.
@@ -40,15 +58,17 @@ The canary will:
 1. preserve the existing immediate-withdrawal path unchanged;
 2. enqueue only a positively identified, allowlisted liquidity-shortfall revert from simulation; all gate, authorization, balance, allowance, deadline, and unknown failures remain on the normal failure path;
 3. persist the exact customer-authorized withdrawal transaction and a durable queue record;
-4. permit at most one active queued withdrawal per vault and chain;
-5. request a bounded number of bpEUR shares from the FXH adapter through the approved `adapterCurator` custody path;
-6. derive progress from contract state and receipts rather than a fixed delay;
-7. observe or invoke `sweepSettled` after the FXH position settles, using a funded and monitored sender when invocation is required;
-8. unless the FXH adapter is the configured `liquidityAdapter`, have an approved allocator or sentinel call `VaultV2.deallocate` for that adapter to move the realized EURC into parent-vault idle;
-9. verify the actual parent-vault idle EURC produced by that deallocation;
-10. re-simulate the exact customer transaction immediately before broadcast;
-11. broadcast it at most once when simulation succeeds; and
-12. otherwise enter an explicit terminal or operator-review state.
+4. return a durable queue identifier and explicit queued status to the caller instead of surfacing the simulated liquidity revert;
+5. notify operators through Telegram when a request queues and on material intervention or terminal transitions;
+6. permit at most one active queued withdrawal per vault and chain;
+7. request a bounded number of bpEUR shares from the FXH adapter through the approved `adapterCurator` custody path;
+8. derive progress from contract state and receipts rather than a fixed delay;
+9. observe or invoke `sweepSettled` after the FXH position settles, using a funded and monitored sender when invocation is required;
+10. unless the FXH adapter is the configured `liquidityAdapter`, have an approved allocator or sentinel call `VaultV2.deallocate` for that adapter to move the realized EURC into parent-vault idle;
+11. verify the actual parent-vault idle EURC produced by that deallocation;
+12. re-simulate the exact customer transaction immediately before broadcast;
+13. broadcast it at most once when simulation succeeds; and
+14. otherwise enter an explicit terminal or operator-review state.
 
 This is **best-effort orchestration**, not an on-chain reservation system. It does not guarantee FIFO fairness, exclusive access to returned liquidity, a fixed settlement time, or successful execution of a transaction whose state has changed while queued.
 
@@ -146,6 +166,16 @@ failed
 
 No state may retry indefinitely. Every transaction submission must have an idempotency key, recorded hash/nonce, bounded attempt count, receipt reconciliation, and an operator-visible reason for stopping.
 
+### Customer, destination, and operator visibility
+
+A queued API response must contain a stable queue identifier and a queryable status; it must not expose the internal simulation revert as the customer-facing outcome. The status remains pending until the customer withdrawal is confirmed on chain.
+
+The original customer-authorized transaction remains authoritative for amount, receiver, and wallet-versus-off-ramp destination. Queue processing must not replace that destination. For a bank withdrawal, the queue hands control back to the existing off-ramp lifecycle after the on-chain withdrawal transaction is confirmed; bank settlement status remains a downstream concern and must not be conflated with FXH liquidity settlement.
+
+Telegram notification is required at queue entry, when human authorization is needed, when pending age crosses the approved operational threshold, when re-signing or operator review is required, and on confirmed or failed completion. Notifications are observational only: database and chain state remain authoritative, and duplicate delivery must not change queue state.
+
+The transcript's end-state aspiration is automatic completion without further customer action. The canary provides that only when delayed customer authorization remains valid. It intentionally retains human authorization for privileged curator and parent-vault deallocation calls until a separate custody decision approves automation.
+
 ### No rebalancing in v1
 
 Restoring target allocations after an FXH unwind is a separate risk and strategy decision. It is explicitly out of scope for this ADR.
@@ -198,6 +228,9 @@ The target chain, deployed addresses, source revisions, roles, gates, token deci
 - Submission is idempotent and bounded.
 - Failure and intervention states are explicit.
 - Canary exposure is bounded by cohort, notional, active-request count, retry count, and pending age.
+- The caller receives a durable queue identifier and queryable status for a recognized liquidity shortfall.
+- Operators receive Telegram notifications for queue entry, intervention thresholds, and terminal outcomes.
+- The original customer-selected wallet or off-ramp destination is preserved.
 
 ## What v1 Does Not Guarantee
 
@@ -210,6 +243,8 @@ The target chain, deployed addresses, source revisions, roles, gates, token deci
 
 These limitations must be present in product and operational language. The system must not describe a queued request as guaranteed or completed before the customer withdrawal is confirmed on chain.
 
+The canary also does not guarantee fully unattended completion: privileged protocol calls remain human-authorized until a separate custody decision approves constrained automation.
+
 ## Stop and Escalation Conditions
 
 Stop the canary and review the contract-enforced queue design if any of the following occurs:
@@ -219,8 +254,10 @@ Stop the canary and review the contract-enforced queue design if any of the foll
 3. delayed transactions require re-signing at an unacceptable rate;
 4. queued notional exceeds the approved operational risk cap;
 5. integrators require a composable on-chain claim or transferable withdrawal receipt;
-6. product or risk requires guaranteed FIFO/pro-rata reservation; or
-7. manual protocol authorization becomes an operational bottleneck and no acceptable constrained-signer design is approved.
+6. product or risk requires guaranteed FIFO/pro-rata reservation;
+7. manual protocol authorization becomes an operational bottleneck and no acceptable constrained-signer design is approved;
+8. customer or operator evidence shows that queued-response or notification semantics are inadequate; or
+9. end-to-end unattended completion becomes a hard requirement and an acceptable constrained-signer design is approved.
 
 A contract-first follow-up must be a separate ADR. It must define custody, cancellation, partial settlement, allocator interaction, reservation accounting, migration, standard-interface compatibility, and emergency behavior before implementation.
 
@@ -259,6 +296,8 @@ A contract-first follow-up must be a separate ADR. It must define custody, cance
 - Only one active illiquid request is supported per vault and chain.
 - Some customers may need to re-sign or retry.
 - The backend requires durable queue storage, reconciliation, monitoring, and runbooks.
+- The first canary is not fully unattended because privileged protocol operations remain human-authorized.
+- Telegram notification and a queryable queued response become required operational surfaces.
 
 ### Neutral
 
@@ -280,8 +319,12 @@ Before changing this ADR to `Accepted`, reviewers must approve:
 - allocator/sentinel and sweep-sender custody, funding, and monitoring;
 - bpEUR unwind-sizing bounds and realized-EURC reconciliation;
 - deployment metadata and finality policy;
-- controlled integration-test evidence; and
-- operational ownership and stop authority for the canary.
+- controlled integration-test evidence;
+- operational ownership and stop authority for the canary;
+- the queued API response contract and status-query surface;
+- Telegram notification recipients, deduplication, and escalation thresholds;
+- preservation of wallet/off-ramp destination and handoff to existing downstream tracking; and
+- whether human-authorized privileged calls satisfy the canary or automation is a release requirement.
 
 ## References
 
