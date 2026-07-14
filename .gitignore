@@ -5,8 +5,11 @@ out/
 # Ignores development broadcast logs
 broadcast/
 
-# Docs
-docs/
+# Generated docs
+docs/*
+!docs/adr/
+docs/adr/*
+!docs/adr/*.md
 
 # Dotenv file
 .env
