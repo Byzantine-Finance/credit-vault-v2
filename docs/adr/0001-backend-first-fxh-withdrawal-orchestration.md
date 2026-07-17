@@ -56,11 +56,22 @@ A contract escrow and reservation queue remains an escalation option. It is not 
 
 ## V1 guardrails
 
+### Liquidity admission
+
+Queue admission has two distinct checks:
+
+- **Authoritative:** simulate the Atlas inner withdrawal call from the wallet address and enqueue only a positively identified liquidity-shortfall selector from the expected vault call. Validate the Atlas authorization, deadline, and unused nonce separately because the current simulation executes inner calls directly rather than the Atlas envelope.
+- **Advisory:** RPC liquidity reads may improve the response shown before signing, but must not decide queue admission until their equation is defined and tested. `AaveStrategy.realAssets()` is the strategy's aToken claim plus idle assets; it is not guaranteed immediately withdrawable Aave liquidity.
+
+Benoit's fake-vault tests must establish stable liquidity and non-liquidity selectors. A production fork must then prove the classification through the deployed VaultV2, Aave strategy, and gates. Matching an error message string alone is not sufficient.
+
 ### Customer authorization
 
-The API may store and later broadcast a transaction already authorized by the customer. It must not create or alter the customer's signature, amount, receiver, or destination.
+All Byzantine wallets use the EIP-7702 Atlas delegation. Atlas supports sponsored execution, a deadline, and replay protection after a successful call; it does not force withdrawals through the Byzantine API.
 
-Before implementation, a controlled test must prove that the Atlas/Turnkey transaction remains valid for the intended delay. Test at least nonce changes, moved shares or revoked allowance, deadlines or sponsorship expiry, receiver gates, vault configuration, share-price changes, and replay.
+The API may store and later broadcast an exact transaction already authorized by the customer. It must not create or alter the customer's signature, amount, receiver, or destination. A failed Atlas execution rolls back Atlas nonce consumption, so the authorization may remain usable. The current API uses an effectively unbounded deadline; the canary must use a bounded withdrawal deadline or an explicit revocation mechanism before delayed automatic broadcast is approved.
+
+A controlled test must cover moved shares or revoked allowance, nonce reuse, deadline and sponsorship expiry, receiver gates, vault configuration, share-price changes, failed execution, and replay.
 
 If delayed authorization is unsafe, the fallback is simple: prepare liquidity, notify the customer, and ask them to sign again.
 
@@ -69,6 +80,8 @@ If delayed authorization is unsafe, the fallback is simple: prepare liquidity, n
 `requestWithdraw` requires `adapterCurator`. Moving settled EURC from the FXH adapter into `VaultV2` may also require an allocator or sentinel.
 
 The first canary uses the currently approved human-authorized custody path for these calls. This ADR does not approve an unattended API-held key. Any later automation needs a separate custody decision and must comply with the API's non-custodial signing rules. Plaintext production keys in application configuration are prohibited.
+
+Alex will assess whether Hypernative can cover withdrawals submitted outside the Byzantine API. Hypernative is not selected by this ADR. Before it can trigger `requestWithdraw`, the design must define observation coverage, curator custody, sizing, idempotency, caps, duplicate suppression, and resistance to deliberately failing withdrawals. A failed direct-wallet transaction is not by itself a durable API queue record or proof that the customer still wants an unwind. Without reusable customer authorization, Hypernative could only replenish liquidity; the customer would still have to retry the withdrawal.
 
 ### Settlement and accounting
 
@@ -102,6 +115,18 @@ Terminal states: `needs_resign`, `liquidity_conflict`, `cancelled`, `expired`, `
 
 No state retries indefinitely. Record idempotency keys, hashes, nonces, attempt counts, receipts, and the reason work stopped.
 
+### Withdrawal limits and queued amounts
+
+`get_vault_v2_max_withdrawal` currently calculates a wallet's asset entitlement from its vault shares. Subtracting the global queued total from that value would mix user ownership with system liquidity and understate unrelated users' entitlement.
+
+Keep these concepts separate:
+
+- **wallet entitlement:** the existing maximum based on the wallet's shares;
+- **API-requestable amount:** wallet entitlement less that wallet's active queued commitment; and
+- **remaining queue capacity:** the canary risk cap less all active queued commitments.
+
+The durable one-active-request rule is the admission lock. These API values are advisory and cannot prevent a direct wallet transaction from moving shares or consuming liquidity; final simulation and chain reconciliation remain required.
+
 ### Customer and operator visibility
 
 A queued response includes a stable queue ID and queryable status. The customer-facing response must not expose the internal simulation revert.
@@ -132,6 +157,14 @@ Post-withdrawal rebalancing is out of scope. It requires a separate strategy and
 | Consider rebalancing later | Deferred. |
 | Propose before implementation | Keep this ADR `Proposed` until the evidence below is reviewed. |
 
+## Open research and owners
+
+- **Benoit — revert classification:** deploy controlled fake vaults to exercise known failures, then repeat the full path on a pinned fork using official deployment addresses. Whitelist the test wallet and receiver before classifying any revert; a gate failure is not a liquidity failure.
+- **Alex — Hypernative/API split:** determine whether Hypernative can observe API-bypassing attempts and safely trigger a bounded unwind. Document custody, deduplication, griefing controls, and which system owns each state transition.
+- **Vault/API — Aave estimate:** define and test an advisory available-liquidity equation. It must account for vault idle, strategy idle, the adapter's aToken claim, actual Aave reserve liquidity, and conditions that can still make `pool.withdraw` revert.
+
+Until these are resolved, simulation remains the only queue-admission authority and the canary covers API-observed requests only.
+
 ## Evidence required before acceptance
 
 A controlled cross-repository test must prove:
@@ -156,8 +189,13 @@ It must also cover:
 - a second illiquid request while one is active;
 - another withdrawal consuming returned EURC;
 - duplicate workers or events and process restart;
-- unavailable protocol authorization or sweep gas; and
-- unsafe sweep/deallocation gas as the position set grows.
+- unavailable protocol authorization or sweep gas;
+- unsafe sweep/deallocation gas as the position set grows;
+- the same liquidity classification against fake vaults and a pinned production fork;
+- a whitelisted fork wallet and receiver, plus negative gate tests;
+- Atlas authorization with a bounded deadline or a tested revocation path;
+- separate wallet-entitlement, per-wallet queued-commitment, and global queue-capacity calculations; and
+- a direct-wallet attempt that bypasses the API, with the documented v1 response.
 
 Record the target chain, source revisions, deployed addresses, roles, gates, decimals, finality policy, and signer custody with the test evidence.
 
@@ -170,8 +208,9 @@ V1 does not guarantee:
 - a still-valid customer transaction after the wait;
 - a completion deadline;
 - fairness beyond one active request;
-- a fixed EURC payout; or
-- unattended protocol operations.
+- a fixed EURC payout;
+- unattended protocol operations; or
+- coverage of withdrawals submitted outside the Byzantine API.
 
 Stop the canary and reconsider contract escrow or signer automation if:
 
@@ -179,8 +218,10 @@ Stop the canary and reconsider contract escrow or signer automation if:
 - more than one concurrent request is needed;
 - re-signing is too frequent;
 - queued value exceeds the approved risk cap;
-- product requires guaranteed reservation or a composable claim; or
-- manual protocol authorization becomes the bottleneck.
+- product requires guaranteed reservation or a composable claim;
+- manual protocol authorization becomes the bottleneck;
+- API-bypassing withdrawal attempts are frequent enough to invalidate the canary; or
+- Hypernative automation cannot meet the approved custody, deduplication, sizing, and grief-resistance constraints.
 
 ## Alternatives
 
@@ -198,15 +239,22 @@ Change this ADR to `Accepted` only after reviewers approve:
 - queue, retry, pending-time, and value limits;
 - curator, allocator/sentinel, and sweep custody;
 - deployment metadata and bpEUR-to-realized-EURC accounting;
-- customer status, destination handoff, Telegram escalation, and stated non-guarantees; and
-- the controlled integration-test evidence and operational owner.
+- customer status, destination handoff, Telegram escalation, and stated non-guarantees;
+- the controlled integration-test evidence and operational owner;
+- the separation between wallet entitlement, per-wallet queued commitment, and global queue capacity;
+- the fake-vault and whitelisted-fork revert-classification evidence;
+- a bounded Atlas deadline or revocation mechanism; and
+- the explicit API-only coverage decision or an approved Hypernative design.
 
 ## References
 
 - [`src/VaultV2.sol`](../../src/VaultV2.sol)
 - [`src/adapters/ByzantineEurVaultAdapter.sol`](../../src/adapters/ByzantineEurVaultAdapter.sol)
 - [`src/adapters/EurVaultPosition.sol`](../../src/adapters/EurVaultPosition.sol)
+- [`src/adapters/AaveStrategy.sol`](../../src/adapters/AaveStrategy.sol)
 - [`Byzantine-Finance/fx-hedge-contract`](https://github.com/Byzantine-Finance/fx-hedge-contract)
 - [`Byzantine-Finance/byzantine-api`](https://github.com/Byzantine-Finance/byzantine-api)
 - [`byzantine-api ADR 0002`](https://github.com/Byzantine-Finance/byzantine-api/blob/dev/docs/adr/0002-standing-integrator-delegated-authority.md)
+- [`Byzantine-Finance/Atlas`](https://github.com/Byzantine-Finance/Atlas/blob/main/src/Atlas.sol)
+- [Byzantine Curator deployment view](https://curator.byzantine.fi/vault/0x2f99e35ea811f3cc230b26dff817604b5d4b6e38?tab=adapters&adapter=0)
 - Internal product discussion, 2026-07-08
