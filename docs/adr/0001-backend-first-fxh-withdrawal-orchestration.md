@@ -1,7 +1,8 @@
 # ADR 0001: Backend-First FXH Withdrawal Orchestration
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-14
+- **Accepted:** 2026-07-20
 - **Owners:** Vault, FXH, API, Product, Security, and Operations maintainers
 - **Scope:** EUR vault withdrawals that exceed immediately available liquidity
 
@@ -155,7 +156,7 @@ Post-withdrawal rebalancing is out of scope. It requires a separate strategy and
 | Complete to a wallet or bank account | Preserve the original receiver/off-ramp destination and broadcast once liquidity is available. |
 | Put the curator key in the API environment | Rejected. Start with approved human custody; decide constrained automation separately. |
 | Consider rebalancing later | Deferred. |
-| Propose before implementation | Keep this ADR `Proposed` until the evidence below is reviewed. |
+| Propose before implementation | Decision accepted; canary rollout remains gated by the evidence below. |
 
 ## Open research and owners
 
@@ -165,7 +166,7 @@ Post-withdrawal rebalancing is out of scope. It requires a separate strategy and
 
 Until these are resolved, simulation remains the only queue-admission authority and the canary covers API-observed requests only.
 
-## Evidence required before acceptance
+## Evidence required before canary rollout
 
 A controlled cross-repository test must prove:
 
@@ -230,9 +231,9 @@ Stop the canary and reconsider contract escrow or signer automation if:
 - **Prepare liquidity, then ask the customer to re-sign — fallback.** Use this if delayed transaction validity cannot be proven.
 - **Keep returning the synchronous error — rejected.** It does not solve the customer or operational problem.
 
-## Acceptance
+## Canary rollout gates
 
-Change this ADR to `Accepted` only after reviewers approve:
+Do not enable the canary until reviewers approve:
 
 - the exact liquidity-shortfall revert classification;
 - delayed authorization or the re-sign fallback;
