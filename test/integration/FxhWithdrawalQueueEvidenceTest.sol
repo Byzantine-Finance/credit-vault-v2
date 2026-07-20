@@ -7,6 +7,29 @@ import {ErrorsLib} from "../../src/libraries/ErrorsLib.sol";
 import {GateWhitelist} from "../../src/gate/GateWhitelist.sol";
 import {IERC20} from "../../src/interfaces/IERC20.sol";
 
+import {IAdapter} from "../../src/interfaces/IAdapter.sol";
+
+contract RevertingDeallocateAdapter is IAdapter {
+    error NestedAdapterFailure();
+
+    function allocate(bytes memory, uint256, bytes4, address)
+        external
+        pure
+        returns (bytes32[] memory ids, int256 change)
+    {
+        ids = new bytes32[](0);
+        change = 0;
+    }
+
+    function deallocate(bytes memory, uint256, bytes4, address) external pure returns (bytes32[] memory, int256) {
+        revert NestedAdapterFailure();
+    }
+
+    function realAssets() external pure returns (uint256) {
+        return 0;
+    }
+}
+
 contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
     address internal constant DEPLOYED_BYZ_EUR_VAULT = 0x2F99e35Ea811F3cC230B26dfF817604B5D4B6e38;
     address internal constant DEPLOYED_EURC = 0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c;
@@ -66,6 +89,87 @@ contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
             bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector,
             "gate failure must not classify as liquidity shortfall"
         );
+        assertTrue(
+            bytes4(revertData) != AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR,
+            "gate failure must not classify as deployed Aave/MYT shortfall"
+        );
+    }
+
+    function testInsufficientSharesControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+        uint256 excessiveShares = vault.balanceOf(address(this)) + 1;
+
+        // Excludes classifier ambiguity with owner share-balance failures: VaultV2 reaches deleteShares and
+        // Solidity reports arithmetic underflow, not a liquidity-adapter shortfall.
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.redeem, (excessiveShares, address(this), address(this))));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSignature("Panic(uint256)", 0x11), "insufficient shares/balance"
+        );
+    }
+
+    function testInsufficientWithdrawalAllowanceControlHasDistinctRevertShape() public {
+        address spender = makeAddr("withdrawalSpender");
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+
+        // Excludes classifier ambiguity with ERC-4626 delegated-withdraw authorization: when caller != owner,
+        // VaultV2 decrements share allowance before burning shares and underflows on missing approval.
+        vm.prank(spender);
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.withdraw, (1, address(this), address(this))));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSignature("Panic(uint256)", 0x11), "insufficient withdrawal allowance"
+        );
+    }
+
+    function testSendSharesGateControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+        GateWhitelist sendSharesGate = new GateWhitelist(address(this));
+        _setSendSharesGate(address(sendSharesGate));
+
+        // Excludes classifier ambiguity with withdrawal owner-gate rejection. VaultV2.exit checks canSendShares
+        // before idle/liquidity deallocation. The send-assets gate is enter/deposit-only in VaultV2, so it is
+        // not a withdrawal failure surface and is intentionally not faked here.
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.withdraw, (1, address(this), address(this))));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSelector(ErrorsLib.CannotSendShares.selector), "send-shares gate"
+        );
+    }
+
+    function testUnauthorizedDeallocateControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+
+        // Excludes classifier ambiguity with the privileged recovery leg: a non-allocator/non-sentinel cannot
+        // call VaultV2.deallocate, and the revert occurs before any adapter/liquidity call.
+        vm.prank(adapterCurator);
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.deallocate, (address(adapter), hex"", 1)));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSelector(ErrorsLib.Unauthorized.selector), "unauthorized deallocate"
+        );
+    }
+
+    function testNestedAdapterFailureControlHasDistinctRevertShape() public {
+        RevertingDeallocateAdapter nestedFailureAdapter = new RevertingDeallocateAdapter();
+        _addAdapter(address(nestedFailureAdapter));
+
+        // Excludes classifier ambiguity with unknown adapter failures: this failure is surfaced through the real
+        // VaultV2.deallocate -> IAdapter.deallocate path, not by a fake outer call.
+        vm.prank(allocator);
+        (bool success, bytes memory revertData) = address(vault)
+            .call(abi.encodeCall(vault.deallocate, (address(nestedFailureAdapter), hex"", EVIDENCE_ASSETS)));
+
+        _assertRawNegative(
+            success,
+            revertData,
+            abi.encodeWithSelector(RevertingDeallocateAdapter.NestedAdapterFailure.selector),
+            "nested adapter failure"
+        );
     }
 
     function testPinnedForkCapturesConfiguredAaveMytWithdrawShortfallRevertBytes() public {
@@ -124,6 +228,37 @@ contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
         assertTrue(
             bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector, "not source-only idle error"
         );
+    }
+
+    function _assertRawNegative(
+        bool success,
+        bytes memory revertData,
+        bytes memory expectedRevertData,
+        string memory label
+    ) internal pure {
+        assertFalse(success, string.concat(label, " should revert"));
+        assertEq(revertData, expectedRevertData, string.concat(label, " raw revert data"));
+        assertEq(bytes4(revertData), bytes4(expectedRevertData), string.concat(label, " selector"));
+        assertTrue(
+            bytes4(revertData) != AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR,
+            string.concat(label, " must not classify as deployed Aave/MYT shortfall")
+        );
+        assertTrue(
+            bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector,
+            string.concat(label, " must not classify as source-only FXH idle shortfall")
+        );
+    }
+
+    function _setSendSharesGate(address gate) internal {
+        vm.prank(curator);
+        vault.submit(abi.encodeCall(vault.setSendSharesGate, (gate)));
+        vault.setSendSharesGate(gate);
+    }
+
+    function _addAdapter(address adapter_) internal {
+        vm.prank(curator);
+        vault.submit(abi.encodeCall(vault.addAdapter, (adapter_)));
+        vault.addAdapter(adapter_);
     }
 
     function vaultAsset(address target) internal view returns (address result) {
