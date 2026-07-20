@@ -10,7 +10,7 @@
 
 `VaultV2` serves withdrawals synchronously. It uses idle EURC first, then asks its configured liquidity adapter for the shortfall. If the adapter cannot provide enough EURC, the transaction reverts.
 
-The July 8 discussion described Aave as the liquid adapter holding roughly 10% of vault assets and the FXH adapter holding roughly 85%. These are deployment observations, not source defaults. We must verify the live configuration before implementation.
+At mainnet block `25,576,274`, the official vault's configured liquidity adapter is `0x4167785e9f3Ecd173Aa4c21Ab6fb1aBB4D5Be050`, an Aave/MYT strategy identified by its `MYT`, `mytAsset`, and `aToken` ABI. The July 8 allocation percentages were not the current withdrawal routing configuration. The pinned-fork evidence fixture captures the deployed shortfall through this adapter as raw revert `0x47bc4b2c` (`NotEnoughAvailableUserBalance()`).
 
 Liquidity can return from FXH through the existing contracts:
 
@@ -64,7 +64,7 @@ Queue admission has two distinct checks:
 - **Authoritative:** simulate the Atlas inner withdrawal call from the wallet address and enqueue only a positively identified liquidity-shortfall selector from the expected vault call. Validate the Atlas authorization, deadline, and unused nonce separately because the current simulation executes inner calls directly rather than the Atlas envelope.
 - **Advisory:** RPC liquidity reads may improve the response shown before signing, but must not decide queue admission until their equation is defined and tested. `AaveStrategy.realAssets()` is the strategy's aToken claim plus idle assets; it is not guaranteed immediately withdrawable Aave liquidity.
 
-Benoit's fake-vault tests must establish stable liquidity and non-liquidity selectors. A production fork must then prove the classification through the deployed VaultV2, Aave strategy, and gates. Matching an error message string alone is not sufficient.
+The evidence fixture captures a controlled source-only FXH `InsufficientIdle()` path and, separately, the deployed Aave/MYT path at pinned block `25,576,274`. The canary classifier for this vault/chain must match the deployed raw selector `0x47bc4b2c`, expected call target, and exact call context. Matching an error message string is forbidden.
 
 ### Customer authorization
 
@@ -88,7 +88,7 @@ Alex will assess whether Hypernative can cover withdrawals submitted outside the
 
 `requestWithdraw` is denominated in bpEUR shares. It cannot request more bpEUR than the adapter holds, and final EURC may be lower after FXH settlement. Record requested shares and reconcile actual EURC.
 
-When Aave is the configured liquidity adapter, settled EURC on the FXH adapter is not yet available to the customer withdrawal. An allocator or sentinel must call:
+The verified deployment currently uses Aave/MYT as `liquidityAdapter`. Settled EURC on the FXH adapter is therefore not yet available to a customer withdrawal. An allocator or sentinel must call:
 
 ```solidity
 VaultV2.deallocate(address(byzantineEurVaultAdapter), "", realizedAssets)
@@ -160,11 +160,11 @@ Post-withdrawal rebalancing is out of scope. It requires a separate strategy and
 
 ## Open research and owners
 
-- **Benoit — revert classification:** deploy controlled fake vaults to exercise known failures, then repeat the full path on a pinned fork using official deployment addresses. Whitelist the test wallet and receiver before classifying any revert; a gate failure is not a liquidity failure.
+- **Complete — deployed liquidity classification:** `test/integration/FxhWithdrawalQueueEvidenceTest.sol` captures the official vault's pinned Aave/MYT shortfall selector and a distinct gate-negative control. The evidence is limited to the listed vault, chain, block, call shape, and selector.
 - **Alex — Hypernative/API split:** determine whether Hypernative can observe API-bypassing attempts and safely trigger a bounded unwind. Document custody, deduplication, griefing controls, and which system owns each state transition.
 - **Vault/API — Aave estimate:** define and test an advisory available-liquidity equation. It must account for vault idle, strategy idle, the adapter's aToken claim, actual Aave reserve liquidity, and conditions that can still make `pool.withdraw` revert.
 
-Until these are resolved, simulation remains the only queue-admission authority and the canary covers API-observed requests only.
+Simulation remains the only queue-admission authority. The verified selector applies only to the pinned vault/chain/call context; canary coverage remains API-observed.
 
 ## Evidence required before canary rollout
 
