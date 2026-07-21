@@ -41,7 +41,7 @@ simulate the customer withdrawal
    → broadcast once or stop in an explicit failure state
 ```
 
-Only an allowlisted liquidity-shortfall revert may enter the queue. Gate, balance, allowance, deadline, authorization, and unknown failures remain normal failures.
+Only an allowlisted liquidity-shortfall revert may enter the queue. Gate, balance, allowance, Atlas nonce, authorization, and unknown failures remain normal failures.
 
 The canary supports one active queued withdrawal per vault and chain. A second illiquid request receives a retry-later response.
 
@@ -61,20 +61,20 @@ A contract escrow and reservation queue remains an escalation option. It is not 
 
 Queue admission has two distinct checks:
 
-- **Authoritative:** simulate the Atlas inner withdrawal call from the wallet address and enqueue only a positively identified liquidity-shortfall selector from the expected vault call. Validate the Atlas authorization, deadline, and unused nonce separately because the current simulation executes inner calls directly rather than the Atlas envelope.
+- **Authoritative:** simulate the Atlas inner withdrawal call from the wallet address and enqueue only a positively identified liquidity-shortfall selector from the expected vault call. Validate the exact persisted Atlas authorization and unused nonce separately because the current simulation executes inner calls directly rather than the Atlas envelope.
 - **Advisory:** RPC liquidity reads may improve the response shown before signing, but must not decide queue admission until their equation is defined and tested. `AaveStrategy.realAssets()` is the strategy's aToken claim plus idle assets; it is not guaranteed immediately withdrawable Aave liquidity.
 
 The evidence fixture captures a controlled source-only FXH `InsufficientIdle()` path and, separately, the deployed Aave/MYT path at pinned block `25,576,274`. The canary classifier for this vault/chain must match the deployed raw selector `0x47bc4b2c`, expected call target, and exact call context. Matching an error message string is forbidden.
 
 ### Customer authorization
 
-All Byzantine wallets use the EIP-7702 Atlas delegation. Atlas supports sponsored execution, a deadline, and replay protection after a successful call; it does not force withdrawals through the Byzantine API.
+All Byzantine wallets use the EIP-7702 Atlas delegation. Atlas supports sponsored execution and replay protection after a successful call; it does not force withdrawals through the Byzantine API.
 
-The API may store and later broadcast an exact transaction already authorized by the customer. It must not create or alter the customer's signature, amount, receiver, or destination. A failed Atlas execution rolls back Atlas nonce consumption, so the authorization may remain usable. The current API uses an effectively unbounded deadline; the canary must use a bounded withdrawal deadline or an explicit revocation mechanism before delayed automatic broadcast is approved.
+The customer authorizes one exact withdrawal call once. V1 persists its exact call bytes, signature components, nonce, and `u64::MAX` Atlas deadline, then later broadcasts that unchanged authorization after final re-simulation. The backend cannot alter the signature, amount, receiver, destination, target, value, or calldata.
 
-A controlled test must cover moved shares or revoked allowance, nonce reuse, deadline and sponsorship expiry, receiver gates, vault configuration, share-price changes, failed execution, and replay.
+This is an intentional final, single-use bearer authorization: any holder of the exact signature/call tuple may relay it until the first successful Atlas execution consumes the nonce. Atlas provides no nonce invalidation or cancellation primitive. API deletion or a customer-facing cancellation flag is operational only and must never be described as revocation. A failed Atlas execution rolls back nonce consumption, so the authorization remains usable.
 
-If delayed authorization is unsafe, the fallback is simple: prepare liquidity, notify the customer, and ask them to sign again.
+Controlled tests must cover moved shares or revoked allowance, Atlas nonce reuse, receiver gates, vault configuration, share-price changes, failed execution, replay, and the exact persisted call/signature release path. Customer copy must state that authorization is final until execution; no re-sign fallback exists in v1.
 
 ### Protocol authority
 
@@ -112,7 +112,7 @@ queued
 → confirmed
 ```
 
-Terminal states: `needs_resign`, `liquidity_conflict`, `cancelled`, `expired`, `operator_review`, and `failed`.
+Terminal states: `liquidity_conflict`, `operator_review`, `failed`, and any explicit final reconciliation failure. There is no v1 `needs_resign`, `cancelled`, or `expired` authorization state.
 
 No state retries indefinitely. Record idempotency keys, hashes, nonces, attempt counts, receipts, and the reason work stopped.
 
@@ -136,9 +136,9 @@ The original transaction remains authoritative for wallet or bank/off-ramp desti
 
 Do not describe a queued request as guaranteed or complete before the customer withdrawal confirms. FXH liquidity settlement and downstream bank settlement are separate statuses.
 
-Telegram notifications are required when a request queues, needs human action, exceeds its pending-time threshold, needs re-signing or review, and reaches a terminal state. Notifications are observational; database and chain state remain authoritative.
+Telegram notifications are required when a request queues, needs human action, exceeds its pending-time threshold, reaches operator review, and reaches a terminal state. Notifications are observational; database and chain state remain authoritative.
 
-The canary is automatic from the customer's perspective only when the stored authorization remains valid. Privileged protocol calls remain human-authorized until a separate decision approves automation.
+The canary is automatic from the customer's perspective because it retains the final exact authorization. Privileged protocol calls remain human-authorized until a separate decision approves automation.
 
 ### Rebalancing
 
@@ -184,7 +184,7 @@ approved simulation failure
 
 It must also cover:
 
-- stale nonce, moved shares or revoked allowance, expired authorization, and replay;
+- stale Atlas nonce, moved shares or revoked allowance, exact-call/signature persistence, failed execution, and replay;
 - partial or zero settlement;
 - unknown simulation failures, which must never queue;
 - a second illiquid request while one is active;
@@ -194,7 +194,7 @@ It must also cover:
 - unsafe sweep/deallocation gas as the position set grows;
 - the same liquidity classification against fake vaults and a pinned production fork;
 - a whitelisted fork wallet and receiver, plus negative gate tests;
-- Atlas authorization with a bounded deadline or a tested revocation path;
+- the final exact Atlas authorization commitment, no-cancellation disclosure, and release path;
 - separate wallet-entitlement, per-wallet queued-commitment, and global queue-capacity calculations; and
 - a direct-wallet attempt that bypasses the API, with the documented v1 response.
 
@@ -206,8 +206,8 @@ V1 does not guarantee:
 
 - on-chain reservation of returned EURC;
 - protection from a competing direct withdrawal;
-- a still-valid customer transaction after the wait;
-- a completion deadline;
+- protection from a competing direct withdrawal;
+- a successful customer withdrawal after the wait if final re-simulation fails;
 - fairness beyond one active request;
 - a fixed EURC payout;
 - unattended protocol operations; or
@@ -217,7 +217,7 @@ Stop the canary and reconsider contract escrow or signer automation if:
 
 - returned liquidity is consumed before broadcast;
 - more than one concurrent request is needed;
-- re-signing is too frequent;
+- exact authorization persistence or release cannot be proven safe;
 - queued value exceeds the approved risk cap;
 - product requires guaranteed reservation or a composable claim;
 - manual protocol authorization becomes the bottleneck;
@@ -227,8 +227,8 @@ Stop the canary and reconsider contract escrow or signer automation if:
 ## Alternatives
 
 - **Contract escrow now — deferred.** Stronger reservation and fairness, but changes ERC-4626 behavior, adds gas to every withdrawal, and requires migration and audit.
-- **Backend canary — selected.** Preserves the hot path and tests the existing async mechanism with bounded exposure.
-- **Prepare liquidity, then ask the customer to re-sign — fallback.** Use this if delayed transaction validity cannot be proven.
+- **Backend canary — selected.** Preserves the hot path, uses a final exact Atlas authorization for no-resign UX, and tests the existing async mechanism with bounded exposure.
+- **Prepare liquidity, then ask the customer to re-sign — rejected.** It violates the required withdrawal UX.
 - **Keep returning the synchronous error — rejected.** It does not solve the customer or operational problem.
 
 ## Canary rollout gates
@@ -236,15 +236,14 @@ Stop the canary and reconsider contract escrow or signer automation if:
 Do not enable the canary until reviewers approve:
 
 - the exact liquidity-shortfall revert classification;
-- delayed authorization or the re-sign fallback;
+- final exact Atlas authorization semantics and no-cancellation disclosure;
 - queue, retry, pending-time, and value limits;
 - curator, allocator/sentinel, and sweep custody;
 - deployment metadata and bpEUR-to-realized-EURC accounting;
 - customer status, destination handoff, Telegram escalation, and stated non-guarantees;
 - the controlled integration-test evidence and operational owner;
 - the separation between wallet entitlement, per-wallet queued commitment, and global queue capacity;
-- the fake-vault and whitelisted-fork revert-classification evidence;
-- a bounded Atlas deadline or revocation mechanism; and
+- the fake-vault and whitelisted-fork revert-classification evidence; and
 - the explicit API-only coverage decision or an approved Hypernative design.
 
 ## References
