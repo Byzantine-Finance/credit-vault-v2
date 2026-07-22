@@ -41,6 +41,15 @@ contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
     address internal constant DEPLOYED_SEND_SHARES_GATE = 0x02B38131Bd473554D2CEd77018c18d030C7CE390;
     address internal constant DEPLOYED_RECEIVE_SHARES_GATE_OWNER = 0xfa61edF2AAF38c103461F7f6493BA36cB16E42Dc;
     address internal constant GATE_ELIGIBLE_HOLDER = 0xbCbB9869BFf5972aA6f86125A49e849D5ddda48B;
+    address internal constant DEPLOYED_PARENT_VAULT = 0xeD7603DF0d6D7387d42D05fAC92CB42C4a275744;
+    address internal constant DEPLOYED_PARENT_ERC4626_ADAPTER = 0xbCbB9869BFf5972aA6f86125A49e849D5ddda48B;
+    address internal constant HISTORICAL_WITHDRAW_OWNER = 0x99A9e4F12b3F15D8d60b8E9F7CfFf36a104B578F;
+    address internal constant HISTORICAL_WITHDRAW_RECEIVER = 0x561929E1C69EC1daf73CC002A6F46DFead368E38;
+    uint256 internal constant FIRST_INCIDENT_MAINNET_BLOCK = 25_580_235;
+    uint256 internal constant SECOND_INCIDENT_MAINNET_BLOCK = 25_580_236;
+    uint256 internal constant THIRD_INCIDENT_MAINNET_BLOCK = 25_580_241;
+    uint256 internal constant OBSERVED_SUCCESS_ASSETS = 861_597e6;
+    uint256 internal constant OBSERVED_FAILURE_ASSETS = 862_000e6;
     uint256 internal constant PINNED_MAINNET_BLOCK = 25_576_274;
     uint256 internal constant EVIDENCE_ASSETS = 100e6;
     uint256 internal constant FORK_WITHDRAW_ASSETS = 1_000_000_000_000;
@@ -230,6 +239,101 @@ contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
         );
     }
 
+    function testPinnedForkParentVaultOneMillionWithdrawBubblesAaveShortfallAtIncidentBlocks() public {
+        string memory rpcUrl = vm.envString("MAINNET_RPC_URL");
+        uint256[3] memory incidentBlocks =
+            [FIRST_INCIDENT_MAINNET_BLOCK, SECOND_INCIDENT_MAINNET_BLOCK, THIRD_INCIDENT_MAINNET_BLOCK];
+
+        for (uint256 i; i < incidentBlocks.length; ++i) {
+            vm.createSelectFork(rpcUrl, incidentBlocks[i]);
+            _assertDeployedParentRouteAndEntitlement(FORK_WITHDRAW_ASSETS);
+
+            (bool success, bytes memory revertData) = _callDeployedParentWithdraw(FORK_WITHDRAW_ASSETS);
+            _assertDeployedAaveShortfall(success, revertData);
+        }
+    }
+
+    function testPinnedForkParentVaultObservedThresholdSeparatesSuccessFromAaveShortfall() public {
+        string memory rpcUrl = vm.envString("MAINNET_RPC_URL");
+        vm.createSelectFork(rpcUrl, FIRST_INCIDENT_MAINNET_BLOCK);
+        _assertDeployedParentRouteAndEntitlement(OBSERVED_SUCCESS_ASSETS);
+        assertEq(IERC20(DEPLOYED_EURC).balanceOf(DEPLOYED_PARENT_VAULT), 0, "parent idle EURC at incident block");
+
+        uint256 receiverBalanceBefore = IERC20(DEPLOYED_EURC).balanceOf(HISTORICAL_WITHDRAW_RECEIVER);
+        uint256 ownerSharesBefore = vaultBalanceOf(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER);
+        uint256 requiredShares = vaultPreviewWithdraw(DEPLOYED_PARENT_VAULT, OBSERVED_SUCCESS_ASSETS);
+        (bool success, bytes memory returnData) = _callDeployedParentWithdraw(OBSERVED_SUCCESS_ASSETS);
+
+        assertTrue(success, "observed 861,597 EURC parent withdrawal succeeds");
+        assertEq(abi.decode(returnData, (uint256)), requiredShares, "withdraw returns burned parent shares");
+        assertEq(
+            IERC20(DEPLOYED_EURC).balanceOf(HISTORICAL_WITHDRAW_RECEIVER) - receiverBalanceBefore,
+            OBSERVED_SUCCESS_ASSETS,
+            "receiver gets exact successful threshold assets"
+        );
+        assertEq(
+            ownerSharesBefore - vaultBalanceOf(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER),
+            requiredShares,
+            "owner burns required parent shares"
+        );
+
+        vm.createSelectFork(rpcUrl, FIRST_INCIDENT_MAINNET_BLOCK);
+        _assertDeployedParentRouteAndEntitlement(OBSERVED_FAILURE_ASSETS);
+        (success, returnData) = _callDeployedParentWithdraw(OBSERVED_FAILURE_ASSETS);
+        _assertDeployedAaveShortfall(success, returnData);
+    }
+
+    function _assertDeployedParentRouteAndEntitlement(uint256 assets) internal view {
+        assertGt(DEPLOYED_PARENT_VAULT.code.length, 0, "parent vault code");
+        assertGt(DEPLOYED_PARENT_ERC4626_ADAPTER.code.length, 0, "parent ERC4626 adapter code");
+        assertGt(DEPLOYED_BYZ_EUR_VAULT.code.length, 0, "child vault code");
+        assertGt(DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY.code.length, 0, "child Aave strategy code");
+
+        assertEq(vaultAsset(DEPLOYED_PARENT_VAULT), DEPLOYED_EURC, "parent asset");
+        assertEq(
+            vaultLiquidityAdapter(DEPLOYED_PARENT_VAULT), DEPLOYED_PARENT_ERC4626_ADAPTER, "parent liquidity adapter"
+        );
+        assertTrue(vaultIsAdapter(DEPLOYED_PARENT_VAULT, DEPLOYED_PARENT_ERC4626_ADAPTER), "parent adapter registered");
+        assertEq(erc4626AdapterParentVault(DEPLOYED_PARENT_ERC4626_ADAPTER), DEPLOYED_PARENT_VAULT, "adapter parent");
+        assertEq(erc4626AdapterVault(DEPLOYED_PARENT_ERC4626_ADAPTER), DEPLOYED_BYZ_EUR_VAULT, "adapter child");
+        assertEq(
+            vaultLiquidityAdapter(DEPLOYED_BYZ_EUR_VAULT),
+            DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY,
+            "child liquidity adapter"
+        );
+
+        assertTrue(vaultCanSendShares(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER), "owner can send shares");
+        assertTrue(
+            vaultCanReceiveAssets(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_RECEIVER), "receiver can receive assets"
+        );
+        assertLe(
+            vaultPreviewWithdraw(DEPLOYED_PARENT_VAULT, assets),
+            vaultBalanceOf(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER),
+            "owner shares cover withdrawal"
+        );
+    }
+
+    function _callDeployedParentWithdraw(uint256 assets) internal returns (bool success, bytes memory returnData) {
+        vm.prank(HISTORICAL_WITHDRAW_OWNER);
+        (success, returnData) = DEPLOYED_PARENT_VAULT.call(
+            abi.encodeWithSignature(
+                "withdraw(uint256,address,address)", assets, HISTORICAL_WITHDRAW_RECEIVER, HISTORICAL_WITHDRAW_OWNER
+            )
+        );
+    }
+
+    function _assertDeployedAaveShortfall(bool success, bytes memory revertData) internal pure {
+        assertFalse(success, "parent withdrawal reaches deployed Aave/MYT shortfall");
+        assertEq(bytes4(revertData), AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR, "Aave V3 selector");
+        assertEq(revertData, hex"47bc4b2c", "Aave V3 NotEnoughAvailableUserBalance raw data");
+        assertEq(revertData.length, 4, "Aave V3 no-argument custom error");
+        assertTrue(bytes4(revertData) != ErrorsLib.CannotReceiveAssets.selector, "not receive-assets gate");
+        assertTrue(bytes4(revertData) != ErrorsLib.CannotSendShares.selector, "not send-shares gate");
+        assertTrue(
+            bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector, "not source-only FXH idle error"
+        );
+    }
+
     function _assertRawNegative(
         bool success,
         bytes memory revertData,
@@ -337,6 +441,18 @@ contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
         assertFalse(parentVaultSuccess, "not Byzantine EUR adapter parentVault ABI");
         (bool eurVaultSuccess,) = target.staticcall(abi.encodeWithSignature("eurVault()"));
         assertFalse(eurVaultSuccess, "not Byzantine EUR adapter eurVault ABI");
+    }
+
+    function erc4626AdapterParentVault(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("parentVault()"));
+        require(success, "adapter parentVault query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function erc4626AdapterVault(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("erc4626Vault()"));
+        require(success, "adapter erc4626Vault query failed");
+        result = abi.decode(data, (address));
     }
 
     function vaultLiquidityAdapter(address target) internal view returns (address result) {

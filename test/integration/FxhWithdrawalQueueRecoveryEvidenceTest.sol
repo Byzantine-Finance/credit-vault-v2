@@ -28,9 +28,14 @@ contract FxhWithdrawalQueueRecoveryEvidenceTest is ByzantineEurVaultIntegrationT
         (bool preRecoverySuccess, bytes memory preRecoveryRevertData) =
             address(vault).call(abi.encodeCall(vault.withdraw, (1, receiver, address(this))));
         assertFalse(preRecoverySuccess, "parent withdrawal should fail before FXH recovery settles");
-        assertEq(bytes4(preRecoveryRevertData), IByzantineEurVaultAdapter.InsufficientIdle.selector, "controlled FXH shortfall selector");
+        assertEq(
+            bytes4(preRecoveryRevertData),
+            IByzantineEurVaultAdapter.InsufficientIdle.selector,
+            "controlled FXH shortfall selector"
+        );
 
-        // Disable automatic deallocation so the final withdrawal proves that explicit parent-idle restoration is required.
+        // Disable automatic deallocation so the final withdrawal proves that explicit parent-idle restoration is
+        // required.
         vm.prank(allocator);
         vault.setLiquidityAdapterAndData(address(0), hex"");
 
