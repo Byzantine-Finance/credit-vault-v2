@@ -13,6 +13,9 @@ contract ERC4626MerklAdapterIntegrationClaimTest is ERC4626MerklAdapterIntegrati
     IERC20 constant baseUSDC = IERC20(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913);
     IERC4626 constant baseStataUSDC = IERC4626(0xC768c589647798a6EE01A91FdE98EF2ed046DBD6);
 
+    /// @dev Amount of shares used to price a share of the parent vault
+    uint256 constant SHARE_UNIT = 1e18;
+
     // Claiming data (bot generated)
     uint256 internal baseForkBlock;
     address internal vaultAddr;
@@ -29,9 +32,10 @@ contract ERC4626MerklAdapterIntegrationClaimTest is ERC4626MerklAdapterIntegrati
     string internal path = string.concat(root, "/test/data/claim_data_merkl_base.json");
 
     function setUp() public virtual override {
+        // The bot's claim data pins the chain, the block and every address involved.
         _loadClaimData(path);
 
-        // Create base fork
+        // Create base fork, at the block the claim data was generated for
         rpcUrl = vm.envString("BASE_RPC_URL");
         forkId = vm.createFork(rpcUrl, baseForkBlock);
         vm.selectFork(forkId);
@@ -43,7 +47,9 @@ contract ERC4626MerklAdapterIntegrationClaimTest is ERC4626MerklAdapterIntegrati
 
         super.setUp();
 
-        // Deploy an apdater with parent vault being `vaultAddr` and etch code to `adapterAddr`
+        // Deploy an apdater with parent vault being `vaultAddr` and etch code to `adapterAddr`.
+        // The Merkle proofs commit to the address of the adapter deployed on Base, so the current implementation is
+        // etched there: the tests run this repo's code against the real on-chain state.
         erc4626MerklAdapter =
             IERC4626MerklAdapter(erc4626MerklAdapterFactory.createERC4626MerklAdapter(vaultAddr, address(stataUSDC)));
         vm.etch(adapterAddr, address(erc4626MerklAdapter).code);
@@ -53,23 +59,110 @@ contract ERC4626MerklAdapterIntegrationClaimTest is ERC4626MerklAdapterIntegrati
         IERC4626MerklAdapter(adapterAddr).setClaimer(rewardClaimer);
     }
 
+    /// @dev 1a. Shows that Merkl rewards can be claimed and swapped into the parent vault's asset in a single call.
     function testClaim() public {
+        // 1. Snapshot the parent vault's asset balance, the swap's final destination.
         uint256 vaultAssetBalanceBefore = IERC20(IVaultV2(vaultAddr).asset()).balanceOf(vaultAddr);
 
+        // 2. Expect the rewards to be claimed from the Merkl distributor, then swapped on the real LiFi diamond.
         vm.expectEmit();
         emit IERC4626MerklAdapter.ClaimRewards(rewardToken, rewardAmount);
 
         vm.expectEmit();
         emit IERC4626MerklAdapter.SwapRewards(lifiDiamond, rewardToken, rewardAmount, swapData);
 
-        // Claim and swap Merkl rewards
+        // 3. Claim and swap Merkl rewards, in the single call the claimer bot makes in production.
         vm.prank(rewardClaimer);
         IERC4626MerklAdapter(adapterAddr).claim(claimData);
 
+        // 4. The parent vault received at least the amount the swap route committed to.
         uint256 vaultAssetBalanceAfter = IERC20(IVaultV2(vaultAddr).asset()).balanceOf(vaultAddr);
         uint256 rewardsInUSDC = vaultAssetBalanceAfter - vaultAssetBalanceBefore;
 
         assertGe(rewardsInUSDC, usdcMinAmountReceived);
+    }
+
+    /// @dev 1b. Shows that claimed and swapped rewards accrue to the parent vault's share price (APY boost).
+    /// @dev Isolated because `firstTotalAssets` is transient: without it, the first interest accrual would
+    /// short-circuit all the subsequent ones for the rest of the test.
+    /// forge-config: default.isolate = true
+    function testClaimBoostsSharePrice() public {
+        IVaultV2 parentVault = IVaultV2(vaultAddr);
+        IERC20 parentVaultAsset = IERC20(parentVault.asset());
+
+        // 1. At this fork block the vault has maxRate == 0, so no interest at all can be distributed and rewards
+        // would never reach the share price. Enable interest distribution as the allocator would in production.
+        // This also syncs the vault's recorded total assets with its real assets.
+        _enableInterestAccrual(parentVault);
+
+        // Distributed interest is capped by `maxRate * elapsed`, so let some time pass to leave room for the
+        // rewards to be accrued.
+        vm.warp(block.timestamp + 1 days);
+
+        // 2. Snapshot the accounting the rewards are expected to move, and the balance measuring them.
+        uint256 totalAssetsBefore = parentVault.totalAssets();
+        uint256 sharePriceBefore = parentVault.convertToAssets(SHARE_UNIT);
+        uint256 totalSupplyBefore = parentVault.totalSupply();
+        uint256 vaultAssetBalanceBefore = parentVaultAsset.balanceOf(vaultAddr);
+
+        // 3. Claim and swap Merkl rewards
+        vm.prank(rewardClaimer);
+        IERC4626MerklAdapter(adapterAddr).claim(claimData);
+
+        uint256 rewardsInAsset = parentVaultAsset.balanceOf(vaultAddr) - vaultAssetBalanceBefore;
+
+        // 4. Both sides are read at the same block.timestamp, so the elapsed time and the yield of the underlying
+        // ERC4626 vault are identical: the whole difference comes from the swapped rewards. They are not capped by
+        // the max rate, and they lift the share price.
+        assertGe(rewardsInAsset, usdcMinAmountReceived, "rewards received by the parent vault");
+        assertEq(parentVault.totalAssets() - totalAssetsBefore, rewardsInAsset, "rewards accrued in totalAssets");
+        assertGt(parentVault.convertToAssets(SHARE_UNIT), sharePriceBefore, "share price boosted by the rewards");
+
+        // 5. The boost survives the accrual, which writes it to storage: no share is minted for the rewards, so
+        // they all go to the existing shareholders.
+        parentVault.accrueInterest();
+
+        assertEq(parentVault.totalSupply(), totalSupplyBefore, "no shares minted for the rewards");
+        assertEq(parentVault.totalAssets() - totalAssetsBefore, rewardsInAsset, "rewards kept in totalAssets");
+        assertGt(parentVault.convertToAssets(SHARE_UNIT), sharePriceBefore, "share price durably increased");
+    }
+
+    /// @dev 1c. Shows that the claim reverts as soon as the swap delivers less than the predefined minimum.
+    function testClaimSlippageTooHighReverts() public {
+        (IERC4626MerklAdapter.MerklParams memory merklParams, IERC4626MerklAdapter.SwapParams[] memory swapParams) =
+            abi.decode(claimData, (IERC4626MerklAdapter.MerklParams, IERC4626MerklAdapter.SwapParams[]));
+
+        // 1. Measure what the LiFi route actually delivers to the parent vault, then undo the claim. The threshold
+        // below is therefore calibrated on the real execution rather than on an arbitrary value.
+        uint256 snapshotId = vm.snapshotState();
+        uint256 vaultAssetBalanceBefore = IERC20(IVaultV2(vaultAddr).asset()).balanceOf(vaultAddr);
+        vm.prank(rewardClaimer);
+        IERC4626MerklAdapter(adapterAddr).claim(claimData);
+        uint256 receivedInAsset = IERC20(IVaultV2(vaultAddr).asset()).balanceOf(vaultAddr) - vaultAssetBalanceBefore;
+        vm.revertToState(snapshotId);
+
+        // 2. Requiring one wei more than the route can deliver is enough to trip the slippage guard: the check is
+        // exact, not approximate.
+        IERC4626MerklAdapter.SwapParams[] memory newSwapParams = _copySwapParams(swapParams, swapParams.length);
+        newSwapParams[0].minAmountOut = receivedInAsset + 1;
+
+        vm.expectRevert(IERC4626MerklAdapter.SlippageTooHigh.selector);
+        vm.prank(rewardClaimer);
+        IERC4626MerklAdapter(adapterAddr).claim(abi.encode(merklParams, newSwapParams));
+
+        // 3. Same for a route delivering only half of the expected amount.
+        newSwapParams[0].minAmountOut = receivedInAsset * 2;
+
+        vm.expectRevert(IERC4626MerklAdapter.SlippageTooHigh.selector);
+        vm.prank(rewardClaimer);
+        IERC4626MerklAdapter(adapterAddr).claim(abi.encode(merklParams, newSwapParams));
+
+        // 4. Both reverts rolled back the claim as well: no partial claim or swap is left behind.
+        assertEq(
+            IERC20(IVaultV2(vaultAddr).asset()).balanceOf(vaultAddr),
+            vaultAssetBalanceBefore,
+            "reverted claims left the parent vault untouched"
+        );
     }
 
     function testSetClaimerNotAuthorizedReverts(address newClaimer) public {
@@ -143,6 +236,33 @@ contract ERC4626MerklAdapterIntegrationClaimTest is ERC4626MerklAdapterIntegrati
         vm.expectRevert(IERC4626MerklAdapter.InvalidData.selector);
         vm.prank(rewardClaimer);
         IERC4626MerklAdapter(adapterAddr).claim(abi.encode(merklParams, newSwapParams));
+    }
+
+    /// @dev Grants the allocator role to `allocator` and lifts the vault's max rate so that interest can be
+    /// distributed to the share price.
+    /// @dev `setMaxRate` is submitted as well as called by the allocator, because the vault deployed on Base
+    /// timelocks it while the current implementation restricts it to the allocator.
+    function _enableInterestAccrual(IVaultV2 parentVault) internal {
+        vm.startPrank(parentVault.curator());
+        parentVault.submit(abi.encodeCall(IVaultV2.setIsAllocator, (allocator, true)));
+        parentVault.setIsAllocator(allocator, true);
+        parentVault.submit(abi.encodeCall(IVaultV2.setMaxRate, MAX_MAX_RATE));
+        vm.stopPrank();
+
+        vm.prank(allocator);
+        parentVault.setMaxRate(MAX_MAX_RATE);
+    }
+
+    function _copySwapParams(IERC4626MerklAdapter.SwapParams[] memory swapParams, uint256 length)
+        internal
+        pure
+        returns (IERC4626MerklAdapter.SwapParams[] memory)
+    {
+        IERC4626MerklAdapter.SwapParams[] memory newSwapParams = new IERC4626MerklAdapter.SwapParams[](length);
+        for (uint256 i = 0; i < length; i++) {
+            newSwapParams[i] = swapParams[i];
+        }
+        return newSwapParams;
     }
 
     function _loadClaimData(string memory _path) internal {
