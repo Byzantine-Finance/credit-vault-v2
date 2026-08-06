@@ -2,27 +2,21 @@
 // Copyright (c) 2026 Morpho Association
 pragma solidity 0.8.28;
 
-import {
-    IWhitelistSendAssetsGate,
-    IIntermediary,
-    SET_IS_WHITELISTED_TYPEHASH
-} from "./interfaces/IWhitelistSendAssetsGate.sol";
-import {DOMAIN_TYPEHASH} from "../libraries/ConstantsLib.sol";
+import {IWhitelistReceiveSharesGate, SET_IS_WHITELISTED_TYPEHASH} from "./interfaces/IWhitelistReceiveSharesGate.sol";
+import {DOMAIN_TYPEHASH} from "../../libraries/ConstantsLib.sol";
 
-/// @dev Using this gate allows to restrict who the funds are initially owned by in a vault's deposits/mints.
-/// @dev As with any send assets gate, nothing prevents whitelisted accounts from using a non whitelisted account's
-/// funds.
-/// @dev If account is registered as a trusted intermediary, IIntermediary(account).initiator() is checked for
-/// whitelisted status instead of account itself. Thus the intermediary should only deposit and mint using assets
-/// initially owned by its current initiator.
+/// @dev Using this gate allows to restrict who can own shares of a vault.
+/// @dev As with any receive shares gates, a whitelisted account could own shares to let other accounts access the
+/// vault's payoff.
+/// @dev CRITICAL NOTE: if a depositor transfers their shares (typically to deposit them on a DeFi protocol), they might
+/// not be able to get their shares back (typically to withdraw them) if they get un-whitelisted afterwards.
 /// @dev No-ops are allowed.
 /// @dev Zero checks are not systematically performed.
-contract WhitelistSendAssetsGate is IWhitelistSendAssetsGate {
+contract WhitelistReceiveSharesGate is IWhitelistReceiveSharesGate {
     address public roleSetter;
-    address public whitelister;
-    mapping(address => uint256) public nonces;
-    mapping(address => bool) public isWhitelisted;
-    mapping(address => bool) public isIntermediary;
+    mapping(address account => bool) public isWhitelister;
+    mapping(address whitelister => mapping(address account => uint256)) public nonces;
+    mapping(address account => bool) public isWhitelisted;
 
     constructor(address _roleSetter) {
         roleSetter = _roleSetter;
@@ -43,9 +37,8 @@ contract WhitelistSendAssetsGate is IWhitelistSendAssetsGate {
         }
     }
 
-    /// @dev Reverts if isIntermediary[account] but account reverts on initiator().
-    function canSendAssets(address account) external view returns (bool) {
-        return isWhitelisted[isIntermediary[account] ? IIntermediary(account).initiator() : account];
+    function canReceiveShares(address account) external view returns (bool) {
+        return isWhitelisted[account];
     }
 
     function setRoleSetter(address newRoleSetter) external {
@@ -54,27 +47,22 @@ contract WhitelistSendAssetsGate is IWhitelistSendAssetsGate {
         emit SetRoleSetter(newRoleSetter);
     }
 
-    function setWhitelister(address newWhitelister) external {
+    function setIsWhitelister(address account, bool newIsWhitelister) external {
         require(msg.sender == roleSetter, NotRoleSetter());
-        whitelister = newWhitelister;
-        emit SetWhitelister(newWhitelister);
+        isWhitelister[account] = newIsWhitelister;
+        emit SetIsWhitelister(account, newIsWhitelister);
     }
 
     function setIsWhitelisted(address account, bool newIsWhitelisted) external {
-        require(msg.sender == whitelister, NotWhitelister());
+        require(isWhitelister[msg.sender], NotWhitelister());
         isWhitelisted[account] = newIsWhitelisted;
-        emit SetIsWhitelisted(account, newIsWhitelisted);
-    }
-
-    function setIsIntermediary(address intermediary, bool newIsIntermediary) external {
-        require(msg.sender == whitelister, NotWhitelister());
-        isIntermediary[intermediary] = newIsIntermediary;
-        emit SetIsIntermediary(intermediary, newIsIntermediary);
+        emit SetIsWhitelisted(msg.sender, account, newIsWhitelisted);
     }
 
     /// @dev Signature malleability is not explicitly prevented but it is not a problem thanks to the nonce.
     /// @dev Allows to batch setIsWhitelisted with the deposit, without requiring a transaction from the whitelister.
     function setIsWhitelistedWithSig(
+        address whitelister,
         address account,
         bool newIsWhitelisted,
         uint256 deadline,
@@ -83,13 +71,21 @@ contract WhitelistSendAssetsGate is IWhitelistSendAssetsGate {
         bytes32 s
     ) external {
         require(deadline >= block.timestamp, DeadlineExpired());
-        bytes32 hashStruct =
-            keccak256(abi.encode(SET_IS_WHITELISTED_TYPEHASH, account, newIsWhitelisted, nonces[account]++, deadline));
+        bytes32 hashStruct = keccak256(
+            abi.encode(
+                SET_IS_WHITELISTED_TYPEHASH,
+                whitelister,
+                account,
+                newIsWhitelisted,
+                nonces[whitelister][account]++,
+                deadline
+            )
+        );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), hashStruct));
         address recovered = ecrecover(digest, v, r, s);
-        require(recovered != address(0) && recovered == whitelister, InvalidSigner());
+        require(recovered != address(0) && recovered == whitelister && isWhitelister[recovered], InvalidSigner());
         isWhitelisted[account] = newIsWhitelisted;
-        emit SetIsWhitelistedWithSig(account, newIsWhitelisted);
+        emit SetIsWhitelistedWithSig(recovered, account, newIsWhitelisted);
     }
 
     /// forge-lint: disable-next-item(mixed-case-function)
