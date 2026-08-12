@@ -1,9 +1,9 @@
 {
   "addresses": {
-    "vault": "0x375f2aC71E77440eb9Fc64e112F6b93D9ba1877f"
+    "vault": "0xafA2ADF69c6b76a656976f6694E19076fDA81a0B"
   },
   "chainInfo": {
-    "chainId": 84532,
-    "deploymentBlock": 31083671
+    "chainId": 8453,
+    "deploymentBlock": 49876168
   }
 }

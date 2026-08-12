@@ -10,14 +10,15 @@ import {IVaultV2} from "../../../src/interfaces/IVaultV2.sol";
 import {ICompoundV3Adapter} from "../../../src/adapters/interfaces/ICompoundV3Adapter.sol";
 import {IERC4626MerklAdapterFactory} from "../../../src/adapters/interfaces/IERC4626MerklAdapterFactory.sol";
 import {IERC4626MerklAdapter} from "../../../src/adapters/interfaces/IERC4626MerklAdapter.sol";
-import {IMorphoMarketV1AdapterFactory} from "../../../src/adapters/interfaces/IMorphoMarketV1AdapterFactory.sol";
-import {IMorphoMarketV1Adapter} from "../../../src/adapters/interfaces/IMorphoMarketV1Adapter.sol";
+import {IMorphoMarketV1AdapterV2Factory} from "../../../src/adapters/interfaces/IMorphoMarketV1AdapterV2Factory.sol";
+import {IMorphoMarketV1AdapterV2} from "../../../src/adapters/interfaces/IMorphoMarketV1AdapterV2.sol";
 import {IMorphoVaultV1AdapterFactory} from "../../../src/adapters/interfaces/IMorphoVaultV1AdapterFactory.sol";
 import {IMorphoVaultV1Adapter} from "../../../src/adapters/interfaces/IMorphoVaultV1Adapter.sol";
 
 contract Vault_Adapter_Deployment_Parser is Script, Test {
     // Token Addresses on Base Mainnet
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address constant EURC = 0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42;
     // Contract Addresses on Base Mainnet
     address constant COMET = 0xb125E6687d4313864e53df431d5425969c15Eb2F;
     address constant COMET_REWARDS = 0x123964802e6ABabBE1Bc9547D72Ef1B69B00A6b1;
@@ -29,8 +30,8 @@ contract Vault_Adapter_Deployment_Parser is Script, Test {
     ICompoundV3Adapter public compoundV3Adapter;
     IERC4626MerklAdapterFactory public erc4626MerklAdapterFactory;
     IERC4626MerklAdapter public erc4626MerklAdapter;
-    IMorphoMarketV1AdapterFactory public morphoMarketV1AdapterFactory;
-    IMorphoMarketV1Adapter public morphoMarketV1Adapter;
+    IMorphoMarketV1AdapterV2Factory public morphoMarketV1AdapterFactory;
+    IMorphoMarketV1AdapterV2 public morphoMarketV1Adapter;
     IMorphoVaultV1AdapterFactory public erc4626AdapterFactory;
     IMorphoVaultV1Adapter public erc4626Adapter;
 
@@ -62,7 +63,7 @@ contract Vault_Adapter_Deployment_Parser is Script, Test {
         erc4626MerklAdapterFactory =
             IERC4626MerklAdapterFactory(stdJson.readAddress(json, ".addresses.erc4626MerklAdapterFactory"));
         morphoMarketV1AdapterFactory =
-            IMorphoMarketV1AdapterFactory(stdJson.readAddress(json, ".addresses.morphoMarketV1AdapterFactory"));
+            IMorphoMarketV1AdapterV2Factory(stdJson.readAddress(json, ".addresses.morphoMarketV1AdapterFactory"));
         erc4626AdapterFactory =
             IMorphoVaultV1AdapterFactory(stdJson.readAddress(json, ".addresses.erc4626AdapterFactory"));
     }

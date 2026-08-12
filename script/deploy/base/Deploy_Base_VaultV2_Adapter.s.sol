@@ -25,7 +25,7 @@ contract Deploy_Base_VaultV2_Adapter is Vault_Adapter_Deployment_Parser {
         vm.startBroadcast(privateKey);
 
         // Deploy Vault
-        vault = IVaultV2(vaultV2Factory.createVaultV2(_vaultOwner, USDC, salt));
+        vault = IVaultV2(vaultV2Factory.createVaultV2(_vaultOwner, EURC, salt));
 
         // STOP RECORDING TRANSACTIONS FOR DEPLOYMENT
         vm.stopBroadcast();
@@ -66,7 +66,7 @@ contract Deploy_Base_VaultV2_Adapter is Vault_Adapter_Deployment_Parser {
             adapter = address(erc4626Adapter);
         } else {
             morphoMarketV1Adapter =
-                IMorphoMarketV1Adapter(morphoMarketV1AdapterFactory.createMorphoMarketV1Adapter(_vault, _underlyingVault));
+                IMorphoMarketV1AdapterV2(morphoMarketV1AdapterFactory.createMorphoMarketV1AdapterV2(_vault));
             adapter = address(morphoMarketV1Adapter);
         }
 
