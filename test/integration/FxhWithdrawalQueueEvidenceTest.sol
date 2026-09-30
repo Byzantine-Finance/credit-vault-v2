@@ -1,0 +1,493 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity 0.8.28;
+
+import {ByzantineEurVaultIntegrationTest} from "./ByzantineEurVaultIntegrationTest.sol";
+import {IByzantineEurVaultAdapter} from "../../src/adapters/interfaces/IByzantineEurVaultAdapter.sol";
+import {ErrorsLib} from "../../src/libraries/ErrorsLib.sol";
+import {GateWhitelist} from "../../src/gate/GateWhitelist.sol";
+import {IERC20} from "../../src/interfaces/IERC20.sol";
+
+import {IAdapter} from "../../src/interfaces/IAdapter.sol";
+
+contract RevertingDeallocateAdapter is IAdapter {
+    error NestedAdapterFailure();
+
+    function allocate(bytes memory, uint256, bytes4, address)
+        external
+        pure
+        returns (bytes32[] memory ids, int256 change)
+    {
+        ids = new bytes32[](0);
+        change = 0;
+    }
+
+    function deallocate(bytes memory, uint256, bytes4, address) external pure returns (bytes32[] memory, int256) {
+        revert NestedAdapterFailure();
+    }
+
+    function realAssets() external pure returns (uint256) {
+        return 0;
+    }
+}
+
+contract FxhWithdrawalQueueEvidenceTest is ByzantineEurVaultIntegrationTest {
+    address internal constant DEPLOYED_BYZ_EUR_VAULT = 0x2F99e35Ea811F3cC230B26dfF817604B5D4B6e38;
+    address internal constant DEPLOYED_EURC = 0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c;
+    address internal constant DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY = 0x4167785e9f3Ecd173Aa4c21Ab6fb1aBB4D5Be050;
+    address internal constant DEPLOYED_ATOKEN = 0xAA6e91C82942aeAE040303Bf96c15a6dBcB82CA0;
+    address internal constant DEPLOYED_CURATOR = 0x6A85d9E2fEC21f9C9452FC4022abf2a21A462851;
+    address internal constant DEPLOYED_RECEIVE_SHARES_GATE = 0x5351999cA54675607d08003d9113553162bB795D;
+    address internal constant DEPLOYED_SEND_ASSETS_GATE = 0x80dc268861Cf57D31c52E8cD0467B3d3024512bc;
+    address internal constant DEPLOYED_SEND_SHARES_GATE = 0x02B38131Bd473554D2CEd77018c18d030C7CE390;
+    address internal constant DEPLOYED_RECEIVE_SHARES_GATE_OWNER = 0xfa61edF2AAF38c103461F7f6493BA36cB16E42Dc;
+    address internal constant GATE_ELIGIBLE_HOLDER = 0xbCbB9869BFf5972aA6f86125A49e849D5ddda48B;
+    address internal constant DEPLOYED_PARENT_VAULT = 0xeD7603DF0d6D7387d42D05fAC92CB42C4a275744;
+    address internal constant DEPLOYED_PARENT_ERC4626_ADAPTER = 0xbCbB9869BFf5972aA6f86125A49e849D5ddda48B;
+    address internal constant HISTORICAL_WITHDRAW_OWNER = 0x99A9e4F12b3F15D8d60b8E9F7CfFf36a104B578F;
+    address internal constant HISTORICAL_WITHDRAW_RECEIVER = 0x561929E1C69EC1daf73CC002A6F46DFead368E38;
+    uint256 internal constant FIRST_INCIDENT_MAINNET_BLOCK = 25_580_235;
+    uint256 internal constant SECOND_INCIDENT_MAINNET_BLOCK = 25_580_236;
+    uint256 internal constant THIRD_INCIDENT_MAINNET_BLOCK = 25_580_241;
+    uint256 internal constant OBSERVED_SUCCESS_ASSETS = 861_597e6;
+    uint256 internal constant OBSERVED_FAILURE_ASSETS = 862_000e6;
+    uint256 internal constant PINNED_MAINNET_BLOCK = 25_576_274;
+    uint256 internal constant EVIDENCE_ASSETS = 100e6;
+    uint256 internal constant FORK_WITHDRAW_ASSETS = 1_000_000_000_000;
+    bytes4 internal constant AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR = 0x47bc4b2c;
+
+    function testSourceOnlyControlledByzantineEurAdapterWithdrawShortfallCapturesExactBytes() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+
+        vm.prank(allocator);
+        vault.allocate(address(adapter), hex"", EVIDENCE_ASSETS);
+
+        vm.prank(allocator);
+        vault.setLiquidityAdapterAndData(address(adapter), hex"");
+
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.withdraw, (1, address(this), address(this))));
+
+        assertFalse(
+            success, "source-only withdraw should revert on unavailable immediate Byzantine EUR adapter liquidity"
+        );
+        assertEq(bytes4(revertData), IByzantineEurVaultAdapter.InsufficientIdle.selector, "shortfall selector");
+        assertEq(
+            revertData,
+            abi.encodeWithSelector(IByzantineEurVaultAdapter.InsufficientIdle.selector),
+            "shortfall revert data"
+        );
+        assertEq(revertData.length, 4, "shortfall custom error has selector only");
+    }
+
+    function testReceiveAssetsGateControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+
+        GateWhitelist receiveAssetsGate = new GateWhitelist(address(this));
+        vm.prank(curator);
+        vault.submit(abi.encodeCall(vault.setReceiveAssetsGate, (address(receiveAssetsGate))));
+        vault.setReceiveAssetsGate(address(receiveAssetsGate));
+
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.withdraw, (1, address(this), address(this))));
+
+        assertFalse(success, "withdraw should revert before liquidity classification when receiver is gated");
+        assertEq(bytes4(revertData), ErrorsLib.CannotReceiveAssets.selector, "gate selector");
+        assertEq(revertData, abi.encodeWithSelector(ErrorsLib.CannotReceiveAssets.selector), "gate revert data");
+        assertEq(revertData.length, 4, "gate custom error has selector only");
+        assertTrue(
+            bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector,
+            "gate failure must not classify as liquidity shortfall"
+        );
+        assertTrue(
+            bytes4(revertData) != AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR,
+            "gate failure must not classify as deployed Aave/MYT shortfall"
+        );
+    }
+
+    function testInsufficientSharesControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+        uint256 excessiveShares = vault.balanceOf(address(this)) + 1;
+
+        // Excludes classifier ambiguity with owner share-balance failures: VaultV2 reaches deleteShares and
+        // Solidity reports arithmetic underflow, not a liquidity-adapter shortfall.
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.redeem, (excessiveShares, address(this), address(this))));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSignature("Panic(uint256)", 0x11), "insufficient shares/balance"
+        );
+    }
+
+    function testInsufficientWithdrawalAllowanceControlHasDistinctRevertShape() public {
+        address spender = makeAddr("withdrawalSpender");
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+
+        // Excludes classifier ambiguity with ERC-4626 delegated-withdraw authorization: when caller != owner,
+        // VaultV2 decrements share allowance before burning shares and underflows on missing approval.
+        vm.prank(spender);
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.withdraw, (1, address(this), address(this))));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSignature("Panic(uint256)", 0x11), "insufficient withdrawal allowance"
+        );
+    }
+
+    function testSendSharesGateControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+        GateWhitelist sendSharesGate = new GateWhitelist(address(this));
+        _setSendSharesGate(address(sendSharesGate));
+
+        // Excludes classifier ambiguity with withdrawal owner-gate rejection. VaultV2.exit checks canSendShares
+        // before idle/liquidity deallocation. The send-assets gate is enter/deposit-only in VaultV2, so it is
+        // not a withdrawal failure surface and is intentionally not faked here.
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.withdraw, (1, address(this), address(this))));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSelector(ErrorsLib.CannotSendShares.selector), "send-shares gate"
+        );
+    }
+
+    function testUnauthorizedDeallocateControlHasDistinctRevertShape() public {
+        vault.deposit(EVIDENCE_ASSETS, address(this));
+
+        // Excludes classifier ambiguity with the privileged recovery leg: a non-allocator/non-sentinel cannot
+        // call VaultV2.deallocate, and the revert occurs before any adapter/liquidity call.
+        vm.prank(adapterCurator);
+        (bool success, bytes memory revertData) =
+            address(vault).call(abi.encodeCall(vault.deallocate, (address(adapter), hex"", 1)));
+
+        _assertRawNegative(
+            success, revertData, abi.encodeWithSelector(ErrorsLib.Unauthorized.selector), "unauthorized deallocate"
+        );
+    }
+
+    function testNestedAdapterFailureControlHasDistinctRevertShape() public {
+        RevertingDeallocateAdapter nestedFailureAdapter = new RevertingDeallocateAdapter();
+        _addAdapter(address(nestedFailureAdapter));
+
+        // Excludes classifier ambiguity with unknown adapter failures: this failure is surfaced through the real
+        // VaultV2.deallocate -> IAdapter.deallocate path, not by a fake outer call.
+        vm.prank(allocator);
+        (bool success, bytes memory revertData) = address(vault)
+            .call(abi.encodeCall(vault.deallocate, (address(nestedFailureAdapter), hex"", EVIDENCE_ASSETS)));
+
+        _assertRawNegative(
+            success,
+            revertData,
+            abi.encodeWithSelector(RevertingDeallocateAdapter.NestedAdapterFailure.selector),
+            "nested adapter failure"
+        );
+    }
+
+    function testPinnedForkCapturesConfiguredAaveMytWithdrawShortfallRevertBytes() public {
+        string memory rpcUrl = vm.envString("MAINNET_RPC_URL");
+        vm.createSelectFork(rpcUrl, PINNED_MAINNET_BLOCK);
+
+        assertGt(DEPLOYED_BYZ_EUR_VAULT.code.length, 0, "official vault code present at pinned block");
+        assertGt(
+            DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY.code.length, 0, "configured strategy code present at pinned block"
+        );
+        assertEq(vaultAsset(DEPLOYED_BYZ_EUR_VAULT), DEPLOYED_EURC, "official vault asset");
+        assertEq(vaultAdapter(DEPLOYED_BYZ_EUR_VAULT, 0), DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY, "adapter[0]");
+        assertEq(
+            vaultLiquidityAdapter(DEPLOYED_BYZ_EUR_VAULT),
+            DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY,
+            "configured liquidity adapter"
+        );
+        assertEq(vaultCurator(DEPLOYED_BYZ_EUR_VAULT), DEPLOYED_CURATOR, "curator");
+        assertEq(vaultReceiveSharesGate(DEPLOYED_BYZ_EUR_VAULT), DEPLOYED_RECEIVE_SHARES_GATE, "receive shares gate");
+        assertEq(vaultReceiveAssetsGate(DEPLOYED_BYZ_EUR_VAULT), address(0), "receive assets gate unset");
+        assertEq(vaultSendAssetsGate(DEPLOYED_BYZ_EUR_VAULT), DEPLOYED_SEND_ASSETS_GATE, "send assets gate");
+        assertEq(vaultSendSharesGate(DEPLOYED_BYZ_EUR_VAULT), DEPLOYED_SEND_SHARES_GATE, "send shares gate");
+        assertTrue(vaultIsAdapter(DEPLOYED_BYZ_EUR_VAULT, DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY), "strategy registered");
+
+        assertAaveMytStrategyShape(DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY);
+
+        assertTrue(vaultCanReceiveShares(DEPLOYED_BYZ_EUR_VAULT, GATE_ELIGIBLE_HOLDER), "holder can receive shares");
+        assertTrue(vaultCanReceiveAssets(DEPLOYED_BYZ_EUR_VAULT, GATE_ELIGIBLE_HOLDER), "holder can receive assets");
+        assertTrue(vaultCanSendShares(DEPLOYED_BYZ_EUR_VAULT, GATE_ELIGIBLE_HOLDER), "holder can send shares");
+        assertTrue(vaultCanSendAssets(DEPLOYED_BYZ_EUR_VAULT, GATE_ELIGIBLE_HOLDER), "holder can send assets");
+
+        uint256 idleAssets = IERC20(DEPLOYED_EURC).balanceOf(DEPLOYED_BYZ_EUR_VAULT);
+        assertEq(idleAssets, 618_965_074, "pinned vault idle EURC changed");
+        assertGt(FORK_WITHDRAW_ASSETS, idleAssets, "withdraw amount must exceed pinned idle EURC");
+
+        uint256 requiredShares = vaultPreviewWithdraw(DEPLOYED_BYZ_EUR_VAULT, FORK_WITHDRAW_ASSETS);
+        assertLe(
+            requiredShares, vaultBalanceOf(DEPLOYED_BYZ_EUR_VAULT, GATE_ELIGIBLE_HOLDER), "holder shares cover withdraw"
+        );
+
+        // Fork-only evidence: vm.prank uses an existing eligible holder to simulate an eth_call sender,
+        // not to claim any production authorization path beyond that holder's deployed gate/share state.
+        vm.prank(GATE_ELIGIBLE_HOLDER);
+        (bool success, bytes memory revertData) = DEPLOYED_BYZ_EUR_VAULT.call(
+            abi.encodeWithSignature(
+                "withdraw(uint256,address,address)", FORK_WITHDRAW_ASSETS, GATE_ELIGIBLE_HOLDER, GATE_ELIGIBLE_HOLDER
+            )
+        );
+
+        assertFalse(success, "fork-only holder withdraw should hit deployed Aave/MYT shortfall path");
+        assertEq(bytes4(revertData), AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR, "Aave V3 selector");
+        assertEq(revertData, hex"47bc4b2c", "Aave V3 NotEnoughAvailableUserBalance raw data");
+        assertEq(revertData.length, 4, "Aave V3 no-argument custom error");
+        assertTrue(bytes4(revertData) != ErrorsLib.CannotReceiveAssets.selector, "not receive-assets gate");
+        assertTrue(bytes4(revertData) != ErrorsLib.CannotSendShares.selector, "not send-shares gate");
+        assertTrue(
+            bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector, "not source-only idle error"
+        );
+    }
+
+    function testPinnedForkParentVaultOneMillionWithdrawBubblesAaveShortfallAtIncidentBlocks() public {
+        string memory rpcUrl = vm.envString("MAINNET_RPC_URL");
+        uint256[3] memory incidentBlocks =
+            [FIRST_INCIDENT_MAINNET_BLOCK, SECOND_INCIDENT_MAINNET_BLOCK, THIRD_INCIDENT_MAINNET_BLOCK];
+
+        for (uint256 i; i < incidentBlocks.length; ++i) {
+            vm.createSelectFork(rpcUrl, incidentBlocks[i]);
+            _assertDeployedParentRouteAndEntitlement(FORK_WITHDRAW_ASSETS);
+
+            (bool success, bytes memory revertData) = _callDeployedParentWithdraw(FORK_WITHDRAW_ASSETS);
+            _assertDeployedAaveShortfall(success, revertData);
+        }
+    }
+
+    function testPinnedForkParentVaultObservedThresholdSeparatesSuccessFromAaveShortfall() public {
+        string memory rpcUrl = vm.envString("MAINNET_RPC_URL");
+        vm.createSelectFork(rpcUrl, FIRST_INCIDENT_MAINNET_BLOCK);
+        _assertDeployedParentRouteAndEntitlement(OBSERVED_SUCCESS_ASSETS);
+        assertEq(IERC20(DEPLOYED_EURC).balanceOf(DEPLOYED_PARENT_VAULT), 0, "parent idle EURC at incident block");
+
+        uint256 receiverBalanceBefore = IERC20(DEPLOYED_EURC).balanceOf(HISTORICAL_WITHDRAW_RECEIVER);
+        uint256 ownerSharesBefore = vaultBalanceOf(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER);
+        uint256 requiredShares = vaultPreviewWithdraw(DEPLOYED_PARENT_VAULT, OBSERVED_SUCCESS_ASSETS);
+        (bool success, bytes memory returnData) = _callDeployedParentWithdraw(OBSERVED_SUCCESS_ASSETS);
+
+        assertTrue(success, "observed 861,597 EURC parent withdrawal succeeds");
+        assertEq(abi.decode(returnData, (uint256)), requiredShares, "withdraw returns burned parent shares");
+        assertEq(
+            IERC20(DEPLOYED_EURC).balanceOf(HISTORICAL_WITHDRAW_RECEIVER) - receiverBalanceBefore,
+            OBSERVED_SUCCESS_ASSETS,
+            "receiver gets exact successful threshold assets"
+        );
+        assertEq(
+            ownerSharesBefore - vaultBalanceOf(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER),
+            requiredShares,
+            "owner burns required parent shares"
+        );
+
+        vm.createSelectFork(rpcUrl, FIRST_INCIDENT_MAINNET_BLOCK);
+        _assertDeployedParentRouteAndEntitlement(OBSERVED_FAILURE_ASSETS);
+        (success, returnData) = _callDeployedParentWithdraw(OBSERVED_FAILURE_ASSETS);
+        _assertDeployedAaveShortfall(success, returnData);
+    }
+
+    function _assertDeployedParentRouteAndEntitlement(uint256 assets) internal view {
+        assertGt(DEPLOYED_PARENT_VAULT.code.length, 0, "parent vault code");
+        assertGt(DEPLOYED_PARENT_ERC4626_ADAPTER.code.length, 0, "parent ERC4626 adapter code");
+        assertGt(DEPLOYED_BYZ_EUR_VAULT.code.length, 0, "child vault code");
+        assertGt(DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY.code.length, 0, "child Aave strategy code");
+
+        assertEq(vaultAsset(DEPLOYED_PARENT_VAULT), DEPLOYED_EURC, "parent asset");
+        assertEq(
+            vaultLiquidityAdapter(DEPLOYED_PARENT_VAULT), DEPLOYED_PARENT_ERC4626_ADAPTER, "parent liquidity adapter"
+        );
+        assertTrue(vaultIsAdapter(DEPLOYED_PARENT_VAULT, DEPLOYED_PARENT_ERC4626_ADAPTER), "parent adapter registered");
+        assertEq(erc4626AdapterParentVault(DEPLOYED_PARENT_ERC4626_ADAPTER), DEPLOYED_PARENT_VAULT, "adapter parent");
+        assertEq(erc4626AdapterVault(DEPLOYED_PARENT_ERC4626_ADAPTER), DEPLOYED_BYZ_EUR_VAULT, "adapter child");
+        assertEq(
+            vaultLiquidityAdapter(DEPLOYED_BYZ_EUR_VAULT),
+            DEPLOYED_CONFIGURED_AAVE_MYT_STRATEGY,
+            "child liquidity adapter"
+        );
+
+        assertTrue(vaultCanSendShares(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER), "owner can send shares");
+        assertTrue(
+            vaultCanReceiveAssets(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_RECEIVER), "receiver can receive assets"
+        );
+        assertLe(
+            vaultPreviewWithdraw(DEPLOYED_PARENT_VAULT, assets),
+            vaultBalanceOf(DEPLOYED_PARENT_VAULT, HISTORICAL_WITHDRAW_OWNER),
+            "owner shares cover withdrawal"
+        );
+    }
+
+    function _callDeployedParentWithdraw(uint256 assets) internal returns (bool success, bytes memory returnData) {
+        vm.prank(HISTORICAL_WITHDRAW_OWNER);
+        (success, returnData) = DEPLOYED_PARENT_VAULT.call(
+            abi.encodeWithSignature(
+                "withdraw(uint256,address,address)", assets, HISTORICAL_WITHDRAW_RECEIVER, HISTORICAL_WITHDRAW_OWNER
+            )
+        );
+    }
+
+    function _assertDeployedAaveShortfall(bool success, bytes memory revertData) internal pure {
+        assertFalse(success, "parent withdrawal reaches deployed Aave/MYT shortfall");
+        assertEq(bytes4(revertData), AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR, "Aave V3 selector");
+        assertEq(revertData, hex"47bc4b2c", "Aave V3 NotEnoughAvailableUserBalance raw data");
+        assertEq(revertData.length, 4, "Aave V3 no-argument custom error");
+        assertTrue(bytes4(revertData) != ErrorsLib.CannotReceiveAssets.selector, "not receive-assets gate");
+        assertTrue(bytes4(revertData) != ErrorsLib.CannotSendShares.selector, "not send-shares gate");
+        assertTrue(
+            bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector, "not source-only FXH idle error"
+        );
+    }
+
+    function _assertRawNegative(
+        bool success,
+        bytes memory revertData,
+        bytes memory expectedRevertData,
+        string memory label
+    ) internal pure {
+        assertFalse(success, string.concat(label, " should revert"));
+        assertEq(revertData, expectedRevertData, string.concat(label, " raw revert data"));
+        assertEq(bytes4(revertData), bytes4(expectedRevertData), string.concat(label, " selector"));
+        assertTrue(
+            bytes4(revertData) != AAVE_NOT_ENOUGH_AVAILABLE_USER_BALANCE_SELECTOR,
+            string.concat(label, " must not classify as deployed Aave/MYT shortfall")
+        );
+        assertTrue(
+            bytes4(revertData) != IByzantineEurVaultAdapter.InsufficientIdle.selector,
+            string.concat(label, " must not classify as source-only FXH idle shortfall")
+        );
+    }
+
+    function _setSendSharesGate(address gate) internal {
+        vm.prank(curator);
+        vault.submit(abi.encodeCall(vault.setSendSharesGate, (gate)));
+        vault.setSendSharesGate(gate);
+    }
+
+    function _addAdapter(address adapter_) internal {
+        vm.prank(curator);
+        vault.submit(abi.encodeCall(vault.addAdapter, (adapter_)));
+        vault.addAdapter(adapter_);
+    }
+
+    function vaultAsset(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("asset()"));
+        require(success, "asset query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultAdapter(address target, uint256 index) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("adapters(uint256)", index));
+        require(success, "adapter query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultIsAdapter(address target, address adapter_) internal view returns (bool result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("isAdapter(address)", adapter_));
+        require(success, "isAdapter query failed");
+        result = abi.decode(data, (bool));
+    }
+
+    function vaultBalanceOf(address target, address account) internal view returns (uint256 result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("balanceOf(address)", account));
+        require(success, "balanceOf query failed");
+        result = abi.decode(data, (uint256));
+    }
+
+    function vaultPreviewWithdraw(address target, uint256 assets) internal view returns (uint256 result) {
+        (bool success, bytes memory data) =
+            target.staticcall(abi.encodeWithSignature("previewWithdraw(uint256)", assets));
+        require(success, "previewWithdraw query failed");
+        result = abi.decode(data, (uint256));
+    }
+
+    function vaultCanReceiveShares(address target, address account) internal view returns (bool result) {
+        (bool success, bytes memory data) =
+            target.staticcall(abi.encodeWithSignature("canReceiveShares(address)", account));
+        require(success, "canReceiveShares query failed");
+        result = abi.decode(data, (bool));
+    }
+
+    function vaultCanReceiveAssets(address target, address account) internal view returns (bool result) {
+        (bool success, bytes memory data) =
+            target.staticcall(abi.encodeWithSignature("canReceiveAssets(address)", account));
+        require(success, "canReceiveAssets query failed");
+        result = abi.decode(data, (bool));
+    }
+
+    function vaultCanSendAssets(address target, address account) internal view returns (bool result) {
+        (bool success, bytes memory data) =
+            target.staticcall(abi.encodeWithSignature("canSendAssets(address)", account));
+        require(success, "canSendAssets query failed");
+        result = abi.decode(data, (bool));
+    }
+
+    function vaultCanSendShares(address target, address account) internal view returns (bool result) {
+        (bool success, bytes memory data) =
+            target.staticcall(abi.encodeWithSignature("canSendShares(address)", account));
+        require(success, "canSendShares query failed");
+        result = abi.decode(data, (bool));
+    }
+
+    function assertAaveMytStrategyShape(address target) internal view {
+        (bool mytSuccess, bytes memory mytData) = target.staticcall(abi.encodeWithSignature("MYT()"));
+        assertTrue(mytSuccess, "MYT probe succeeds");
+        assertGt(mytData.length, 0, "MYT probe returns data");
+
+        (bool mytAssetSuccess, bytes memory mytAssetData) = target.staticcall(abi.encodeWithSignature("mytAsset()"));
+        assertTrue(mytAssetSuccess, "mytAsset probe succeeds");
+        assertEq(abi.decode(mytAssetData, (address)), DEPLOYED_EURC, "myt asset");
+
+        (bool aTokenSuccess, bytes memory aTokenData) = target.staticcall(abi.encodeWithSignature("aToken()"));
+        assertTrue(aTokenSuccess, "aToken probe succeeds");
+        assertEq(abi.decode(aTokenData, (address)), DEPLOYED_ATOKEN, "aToken");
+
+        (bool parentVaultSuccess,) = target.staticcall(abi.encodeWithSignature("parentVault()"));
+        assertFalse(parentVaultSuccess, "not Byzantine EUR adapter parentVault ABI");
+        (bool eurVaultSuccess,) = target.staticcall(abi.encodeWithSignature("eurVault()"));
+        assertFalse(eurVaultSuccess, "not Byzantine EUR adapter eurVault ABI");
+    }
+
+    function erc4626AdapterParentVault(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("parentVault()"));
+        require(success, "adapter parentVault query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function erc4626AdapterVault(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("erc4626Vault()"));
+        require(success, "adapter erc4626Vault query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultLiquidityAdapter(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("liquidityAdapter()"));
+        require(success, "liquidityAdapter query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultCurator(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("curator()"));
+        require(success, "curator query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultReceiveSharesGate(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("receiveSharesGate()"));
+        require(success, "receiveSharesGate query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultReceiveAssetsGate(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("receiveAssetsGate()"));
+        require(success, "receiveAssetsGate query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultSendSharesGate(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("sendSharesGate()"));
+        require(success, "sendSharesGate query failed");
+        result = abi.decode(data, (address));
+    }
+
+    function vaultSendAssetsGate(address target) internal view returns (address result) {
+        (bool success, bytes memory data) = target.staticcall(abi.encodeWithSignature("sendAssetsGate()"));
+        require(success, "sendAssetsGate query failed");
+        result = abi.decode(data, (address));
+    }
+}
