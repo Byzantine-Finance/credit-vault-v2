@@ -1,0 +1,11 @@
+{
+  "addresses": {
+    "adapter": "0x917aEF878265318099d5D6B1c9bA556c0A0c5c7e",
+    "adapterType": 3,
+    "vault": "0x375f2aC71E77440eb9Fc64e112F6b93D9ba1877f"
+  },
+  "chainInfo": {
+    "chainId": 84532,
+    "deploymentBlock": 31084317
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "addresses": {
+    "adapterId": "0x77a79ab9ea819df36b84d0af9324a2e39b3d6d0e77494589c32f0225c8d7bc43",
+    "byzantineEurVaultAdapter": "0xC4382756EC10ed6b1BE5f35b8f77249124Ad1d5C",
+    "byzantineEurVaultAdapterFactory": "0x4c2B9d9a1992C954C8DcC22eae76f5816acc4e7d",
+    "eurVault": "0xe8A2Da16AD816aA38BC57fEF78478d756695d9a8",
+    "parentVault": "0x7aA6B0aff73E3E0416CdfCD64F51E5cFa910ad01",
+    "positionImplementation": "0x22B9B3399cb0773302Db79AFCe8dA3C47B19f35a"
+  },
+  "chainInfo": {
+    "chainId": 8453,
+    "deploymentBlock": 50267707
+  }
+}
