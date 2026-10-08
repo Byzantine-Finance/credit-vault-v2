@@ -249,7 +249,9 @@ contract StataIntegrationTest is ERC4626MerklAdapterIntegrationTest {
         uint256 convertedShares = vault.convertToShares(depositAmount);
         uint256 convertedAssets = vault.convertToAssets(shares);
 
-        assertApproxEqAbs(convertedShares, shares, 1, "Share conversion mismatch");
+        // Stata rounds the deposit down by up to 1 wei of USDC, which shifts the share price by up to
+        // `virtualShares` shares per asset wei.
+        assertApproxEqAbs(convertedShares, shares, vault.virtualShares(), "Share conversion mismatch");
         assertApproxEqAbs(convertedAssets, depositAmount, 1, "Asset conversion mismatch");
     }
 
