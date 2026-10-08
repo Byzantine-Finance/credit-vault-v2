@@ -55,6 +55,7 @@ contract EurVaultPosition is IEurVaultPosition {
         batchId_ = _activeBatchId();
 
         SafeERC20Lib.safeApprove(asset, eurVault, assets);
+        // forge-lint: disable-next-item(reentrancy-no-eth) the EUR vault is trusted and this clone is adapter-only.
         IByzantinePrimeEURVault(eurVault).requestDeposit(assets, address(this));
 
         netAssets = _netAssetsAfterDepositFee(assets);
@@ -70,6 +71,7 @@ contract EurVaultPosition is IEurVaultPosition {
         require(batchId == 0, AlreadyInitialized());
         batchId_ = _activeBatchId();
 
+        // forge-lint: disable-next-item(reentrancy-no-eth) the EUR vault is trusted and this clone is adapter-only.
         IByzantinePrimeEURVault(eurVault).requestWithdraw(shares, address(this), address(this));
 
         batchId = batchId_;

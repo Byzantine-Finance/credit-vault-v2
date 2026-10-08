@@ -85,6 +85,7 @@ contract MYTStrategy is IMYTStrategy, Ownable {
         uint256 oldAllocation = allocation();
         uint256 newAllocation = _totalValue();
         emit Allocate(amountAllocated, address(this));
+        // forge-lint: disable-next-item(unsafe-typecast) allocations are bounded by the asset supply, far below 2**255.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
@@ -118,6 +119,7 @@ contract MYTStrategy is IMYTStrategy, Ownable {
         require(totalValueAfter >= assets, "inconsistent totalValue");
         uint256 newAllocation = totalValueAfter - assets;
         emit Deallocate(amountDeallocated, address(this));
+        // forge-lint: disable-next-item(unsafe-typecast) allocations are bounded by the asset supply, far below 2**255.
         return (ids(), int256(newAllocation) - int256(oldAllocation));
     }
 
@@ -196,6 +198,7 @@ contract MYTStrategy is IMYTStrategy, Ownable {
         require(!_isProtectedToken(token), "Protected token");
         uint256 balance = IERC20(token).balanceOf(address(this));
         require(amount <= balance, "Insufficient balance");
+        // forge-lint: disable-next-item(erc20-unchecked-transfer) audited code, kept as is.
         IERC20(token).transfer(to, amount);
         emit TokensRescued(token, to, amount);
     }

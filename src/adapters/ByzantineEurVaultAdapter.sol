@@ -215,6 +215,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
         for (uint256 i; i < 4;) {
             address gate = gates[i];
             if (gate != address(0) && !_seenBefore(gates, gate, i)) {
+                // forge-lint: disable-next-item(reentrancy-no-eth) gates are trusted contracts set by the EUR vault.
                 ICloneWhitelistGate(gate).setIsCloneWhitelisted(salt, true);
             }
             unchecked {
@@ -286,6 +287,7 @@ contract ByzantineEurVaultAdapter is IByzantineEurVaultAdapter {
                 if (depositPositionOf[bid] == address(position)) delete depositPositionOf[bid];
                 else if (withdrawPositionOf[bid] == address(position)) delete withdrawPositionOf[bid];
 
+                // forge-lint: disable-next-item(reentrancy-no-eth) positions are trusted clones of positionImplementation.
                 (uint256 shares, uint256 eurc) = position.sweep();
                 emit SweepPosition(address(position), shares, eurc);
                 // Swap the last element into the current position and pop the last element
