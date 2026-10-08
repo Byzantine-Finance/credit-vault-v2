@@ -9,7 +9,8 @@ dynamic_test_linking = true
 #                           hooks all revert, so the post-dispatch code is provably dead.
 #  5667 unused-parameter  — the adapter ABI forces selector/sender/amount params that
 #                           some base implementations don't use.
-ignored_error_codes = [5740, 5667]
+ignored_error_codes = [5740, 5667, "transient-storage"]
+ignored_error_codes_from = [["test", ["code-size", "init-code-size"]]]
 fs_permissions = [
   { access = "read-write", path = "./script" },
   { access = "read", path = "./test/data" }
@@ -19,6 +20,20 @@ fs_permissions = [
 wrap_comments = true
 
 [profile.default.lint]
+ignore = [
+    "lib/**",
+    "src/imports/MorphoImport.sol",
+    "src/imports/MidnightImport.sol",
+    "src/imports/MetaMorphoImport.sol",
+    "src/imports/MetaMorphoV1_1Import.sol",
+    "src/imports/AdaptiveCurveIrmImport.sol",
+    "test/**/*.sol",
+    "src/adapters/MYTStrategy.sol",
+    "src/adapters/interfaces/IMYTStrategy.sol",
+    "src/libraries/TokenUtils.sol",
+    "src/interfaces/IERC20Burnable.sol",
+    "src/interfaces/IERC20Mintable.sol",
+]
 exclude_lints = [
     "screaming-snake-case-immutable",
     "asm-keccak256",
@@ -43,14 +58,6 @@ exclude_lints = [
     "uninitialized-local",
     "reentrancy-events",
 ]
-ignore = [
-    'test/**/*.sol',
-    'src/adapters/MYTStrategy.sol',
-    'src/adapters/interfaces/IMYTStrategy.sol',
-    'src/libraries/TokenUtils.sol',
-    'src/interfaces/IERC20Burnable.sol',
-    'src/interfaces/IERC20Mintable.sol',
-]
 
 [profile.no_via_ir]
 via_ir = false
@@ -73,6 +80,21 @@ paths = "src/imports/MetaMorphoImport.sol"
 optimizer_runs = 200
 evm_version = "cancun"
 
+[[profile.default.compilation_restrictions]]
+paths = "src/adapters/MidnightAdapter.sol"
+optimizer_runs = 6000
+evm_version = "osaka"
+
+[[profile.default.compilation_restrictions]]
+paths = "lib/midnight/src/**"
+evm_version = "osaka"
+
+# Midnight is compiled with its home repo's settings so it fits under EIP-170.
+[[profile.default.compilation_restrictions]]
+paths = "lib/midnight/src/Midnight.sol"
+optimizer_runs = 466
+evm_version = "osaka"
+
 # Registries have been deployed with the following settings differences, which are enforced here to avoid bytecode drift.
 [[profile.default.compilation_restrictions]]
 paths = "src/periphery/registries/**"
@@ -91,6 +113,16 @@ evm_version = "paris"
 name = "200-cancun"
 optimizer_runs = 200
 evm_version = "cancun"
+
+[[profile.default.additional_compiler_profiles]]
+name = "6000-osaka"
+optimizer_runs = 6000
+evm_version = "osaka"
+
+[[profile.default.additional_compiler_profiles]]
+name = "466-osaka"
+optimizer_runs = 466
+evm_version = "osaka"
 
 [[profile.default.additional_compiler_profiles]]
 name = "999999-cancun"
